@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Link libc: on macOS syscalls must route through libc (no stable syscall
+    // ABI), and the supervisor's sockets/threads/process spawning use it. Matches
+    // nether and swerver.
+    exe.root_module.link_libc = true;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -33,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    tests.root_module.link_libc = true;
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
