@@ -1,0 +1,12 @@
+.{
+    .name = .nether_supervisor,
+    .version = "0.0.0",
+    .fingerprint = 0x1562852e0efd3e95,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{},
+}
