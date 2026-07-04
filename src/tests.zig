@@ -10,4 +10,7 @@ comptime {
     _ = @import("control_client.zig");
     _ = @import("control_server.zig");
     _ = @import("vm.zig");
+    _ = @import("launcher.zig");
+    _ = @import("pool.zig");
+    _ = @import("readiness.zig");
 }
