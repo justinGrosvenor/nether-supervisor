@@ -48,6 +48,21 @@ pub const RealLauncher = struct {
     /// and data sockets (absolute, under the caller's socket_dir) are written
     /// into the generated nether.conf; kernels are symlinked into the cwd.
     pub fn spawnCold(self: *const RealLauncher, id: u32, control_socket: []const u8, data_socket: []const u8) Error!std.c.pid_t {
+        return self.spawn(id, control_socket, data_socket, "");
+    }
+
+    /// Spawn a fork (restore) from `base_snap`. The restore inherits the base's
+    /// RAM (running server + data plane) over CoW, so cpus/ram_mb/kernels are
+    /// unused; only restore=1 + restore_from and the fresh sockets matter. This
+    /// is the warm path (~76ms to first byte vs a multi-second cold boot).
+    pub fn spawnFork(self: *const RealLauncher, id: u32, control_socket: []const u8, data_socket: []const u8, base_snap: []const u8) Error!std.c.pid_t {
+        return self.spawn(id, control_socket, data_socket, base_snap);
+    }
+
+    /// Shared spawn: build the per-VM cwd + nether.conf and fork/exec nether.
+    /// `restore_from` empty => cold boot; non-empty => fork from that snapshot.
+    fn spawn(self: *const RealLauncher, id: u32, control_socket: []const u8, data_socket: []const u8, restore_from: []const u8) Error!std.c.pid_t {
+        const is_fork = restore_from.len > 0;
         var cwd_buf: [512]u8 = undefined;
         const cwd = std.fmt.bufPrintZ(&cwd_buf, "{s}/{x:0>8}", .{ self.work_root, id }) catch return error.PathTooLong;
 
@@ -57,20 +72,24 @@ pub const RealLauncher = struct {
         os.mkdirZ(root_z);
         os.mkdirZ(cwd);
 
-        // Symlink kernels/ into the cwd (nether reads kernels/ from cwd). Forks
-        // do not need it, but the symlink is harmless.
-        var link_buf: [600]u8 = undefined;
-        const link_z = std.fmt.bufPrintZ(&link_buf, "{s}/kernels", .{cwd}) catch return error.PathTooLong;
-        var target_buf: [512]u8 = undefined;
-        const target_z = std.fmt.bufPrintZ(&target_buf, "{s}", .{self.kernels_dir}) catch return error.PathTooLong;
-        os.symlinkForceZ(target_z, link_z);
+        // Symlink kernels/ into the cwd (nether reads kernels/ from cwd on a cold
+        // boot). A fork restores from the snapshot and never reads kernels, so
+        // skip the symlink there.
+        if (!is_fork) {
+            var link_buf: [600]u8 = undefined;
+            const link_z = std.fmt.bufPrintZ(&link_buf, "{s}/kernels", .{cwd}) catch return error.PathTooLong;
+            var target_buf: [512]u8 = undefined;
+            const target_z = std.fmt.bufPrintZ(&target_buf, "{s}", .{self.kernels_dir}) catch return error.PathTooLong;
+            os.symlinkForceZ(target_z, link_z);
+        }
 
-        // Write the cold-boot nether.conf into the cwd.
+        // Write the nether.conf into the cwd (fork adds restore=1 + restore_from).
         var conf_buf: [1024]u8 = undefined;
         const conf_text = vm.bootConfText(&conf_buf, .{
             .id = "",
             .control_socket = control_socket,
             .data_socket = data_socket,
+            .restore_from = restore_from,
             .app_port = self.app_port,
             .cpus = self.cpus,
             .ram_mb = self.ram_mb,

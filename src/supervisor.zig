@@ -13,6 +13,7 @@ const proto = @import("proto.zig");
 const pool_mod = @import("pool.zig");
 const launcher_mod = @import("launcher.zig");
 const boot = @import("boot.zig");
+const control_client = @import("control_client.zig");
 const control_server = @import("control_server.zig");
 const log = @import("log.zig");
 
@@ -31,6 +32,13 @@ pub const Supervisor = struct {
     vms: [pool_mod.CAP]VmProc = [1]VmProc{.{}} ** pool_mod.CAP,
     next_waiter: u64 = 1,
     listen_fd: std.posix.fd_t = -1,
+    /// Backs the absolute base-snapshot path once baked (nether jails the
+    /// snapshot into the base VM cwd, so the real fork source is derived, not
+    /// the config value). cfg/pool base_snap slices point in here after bake.
+    base_snap_buf: [512]u8 = undefined,
+
+    /// Reserved vm id for the transient base VM (the pool issues ids from 1).
+    const BASE_ID: u32 = 0;
 
     pub fn init(cfg: config.Config) Supervisor {
         return .{
@@ -70,8 +78,12 @@ pub const Supervisor = struct {
 
     fn spawnImpl(ctx: *anyopaque, spec: launcher_mod.LaunchSpec) launcher_mod.LaunchError!void {
         const self: *Supervisor = @ptrCast(@alignCast(ctx));
-        // Cold-boot for the gate (base_snap unset). Fork path lands in Phase 4.
-        const pid = self.real.spawnCold(spec.vm_id, spec.control_socket, spec.data_socket) catch return error.SpawnFailed;
+        // Warm-fork when the pool handed us a base snapshot to restore from
+        // (run() bakes it before accepting); otherwise cold-boot.
+        const pid = if (spec.restore_from.len > 0)
+            self.real.spawnFork(spec.vm_id, spec.control_socket, spec.data_socket, spec.restore_from) catch return error.SpawnFailed
+        else
+            self.real.spawnCold(spec.vm_id, spec.control_socket, spec.data_socket) catch return error.SpawnFailed;
         for (&self.vms) |*v| {
             if (!v.active) {
                 v.* = .{ .active = true, .vm_id = spec.vm_id, .pid = pid };
@@ -119,14 +131,14 @@ pub const Supervisor = struct {
             .parked => {},
         }
 
-        // MISS: a cold VM was spawned. Drive it to serving synchronously.
+        // MISS: a VM was spawned. Drive it to serving synchronously.
         const info = self.pool.bootingInfo(tenant) orelse {
             return proto.buildReply(out, "no booting vm", 1) catch out[0..0];
         };
-        log.info("ensure {s}: cold boot vm={x} (control={s})", .{ tenant, info.vm_id, info.control_socket });
+        const is_fork = self.cfg.base_snap.len > 0;
+        log.info("ensure {s}: {s} vm={x} (control={s})", .{ tenant, if (is_fork) "fork" else "cold boot", info.vm_id, info.control_socket });
 
         var answers: [pool_mod.MAX_WAITERS]pool_mod.Answer = undefined;
-        const is_fork = self.cfg.base_snap.len > 0;
         boot.bringUp(info.control_socket, info.data_socket, is_fork, self.cfg.boot_budget_ms, nowMs) catch |e| {
             log.err("ensure {s}: bring-up failed: {s}", .{ tenant, @errorName(e) });
             _ = self.pool.onFailed(info.vm_id, "bring-up failed", &answers);
@@ -190,8 +202,55 @@ pub const Supervisor = struct {
         }
     }
 
+    /// Bake the warm-fork base once at startup: cold-boot a base VM, drive it to
+    /// serving, `__snapshot__` it to cfg.base_snap, then shut it down. Per-tenant
+    /// ensures then fork from that snapshot (~76ms) instead of full cold boots.
+    /// The base is NOT tracked in self.vms (it is transient and reaped here).
+    fn bakeBase(self: *Supervisor) !void {
+        var cbuf: [os.SUN_PATH_MAX + 32]u8 = undefined;
+        var dbuf: [os.SUN_PATH_MAX + 32]u8 = undefined;
+        const p = try @import("vm.zig").socketPaths(self.cfg.socket_dir, "base", &cbuf, &dbuf);
+
+        log.info("baking warm-fork base (id={x:0>8})", .{BASE_ID});
+        const pid = try self.real.spawnCold(BASE_ID, p.control, p.data);
+        errdefer os.killPid(pid, os.SIGTERM);
+
+        // Drive the base to a serving state (starts the guest server via SRV).
+        try boot.bringUp(p.control, p.data, false, self.cfg.boot_budget_ms, nowMs);
+
+        // Snapshot the running server + data plane, then shut the base down. The
+        // snapshot blocks until the file is on disk, so a successful reply means
+        // forks can restore from it. nether jails the snapshot path to the VM's
+        // cwd, so pass a bare filename; the real fork source is <base_cwd>/base.snap.
+        var client = control_client.Client.connect(p.control) catch return error.BaseSnapshotFailed;
+        defer client.close();
+        _ = client.handshake(.{ .hang_ms = 2000 }) catch {};
+        const ok = client.snapshot("base.snap", .{ .hang_ms = 30000 }) catch return error.BaseSnapshotFailed;
+        if (!ok) return error.BaseSnapshotFailed;
+        client.shutdown(.{ .hang_ms = 3000 });
+        _ = os.waitpidNoHang(pid); // best-effort reap; the base exits on shutdown
+
+        // Point forks at the jailed snapshot's absolute path (config base_snap was
+        // only the enable toggle). Both cfg copies drive fork-vs-cold decisions.
+        const abs = std.fmt.bufPrint(&self.base_snap_buf, "{s}/{x:0>8}/base.snap", .{ self.cfg.work_root, BASE_ID }) catch return error.PathTooLong;
+        self.cfg.base_snap = abs;
+        self.pool.cfg.base_snap = abs;
+        log.info("warm-fork base ready ({s})", .{abs});
+    }
+
     /// Run the gate: bind the north control socket and serve connections. Blocks.
     pub fn run(self: *Supervisor) !void {
+        // Warm-fork mode: bake the base before accepting so the first ensure can
+        // already fork. If the bake fails, fall back to cold-boot (clear the base
+        // in both config copies so ensure hands out restore_from="").
+        if (self.cfg.base_snap.len > 0) {
+            self.bakeBase() catch |e| {
+                log.err("base bake failed ({s}); falling back to cold-boot", .{@errorName(e)});
+                self.cfg.base_snap = "";
+                self.pool.cfg.base_snap = "";
+            };
+        }
+
         self.listen_fd = try os.listenUnix(self.cfg.control_socket);
         log.info("north control socket listening at {s}", .{self.cfg.control_socket});
         while (true) {
