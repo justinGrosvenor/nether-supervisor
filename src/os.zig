@@ -82,6 +82,22 @@ pub fn killPid(pid: std.c.pid_t, sig: c_int) void {
     _ = std.c.kill(pid, @enumFromInt(sig));
 }
 
+pub const ReapResult = struct { reaped: bool, pid: std.c.pid_t, exit_code: u8 };
+
+/// Reap ANY one dead child without blocking (waitpid(-1, WNOHANG)). Returns
+/// reaped=false when no child has died (or there are no children). The reaper
+/// loops this to drain every zombie each tick; a matched pid drives crash
+/// eviction.
+pub fn reapAnyNoHang() ReapResult {
+    var status: c_int = 0;
+    const WNOHANG = 1;
+    const rc = std.c.waitpid(-1, &status, WNOHANG);
+    if (rc <= 0) return .{ .reaped = false, .pid = 0, .exit_code = 0 };
+    const exited = (status & 0x7f) == 0;
+    const code: u8 = if (exited) @intCast((status >> 8) & 0xff) else 255;
+    return .{ .reaped = true, .pid = rc, .exit_code = code };
+}
+
 /// Monotonic milliseconds (std.posix.clock_gettime is gone in 0.16; use the
 /// system call directly like swerver's clock.zig).
 pub fn monotonicMs() u64 {

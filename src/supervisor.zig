@@ -20,10 +20,18 @@ const control_server = @import("control_server.zig");
 const log = @import("log.zig");
 const Lock = @import("lock.zig").Lock;
 
-/// Housekeeping cadence: idle-reclaim + waiter-deadline sweep.
+/// Housekeeping cadence: reap + idle-reclaim + waiter-deadline sweep.
 const HOUSEKEEP_MS: u64 = 250;
 /// Waiter poll interval while its bring-up owner drives the boot.
 const WAITER_POLL_MS: u64 = 10;
+
+/// Set by SIGTERM/SIGINT (async-signal-safe: a single atomic store). The
+/// housekeeping thread observes it and drives graceful teardown.
+var g_shutdown = std.atomic.Value(bool).init(false);
+
+fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
+    g_shutdown.store(true, .release);
+}
 
 /// Tracks a spawned VM process so the launcher can kill it and bring-up can find
 /// its sockets. Indexed alongside pool slots by vm_id.
@@ -310,6 +318,8 @@ pub const Supervisor = struct {
 
     /// Run the gate: bind the north control socket and serve connections. Blocks.
     pub fn run(self: *Supervisor) !void {
+        installSignals();
+
         // Warm-fork mode: bake the base before accepting so the first ensure can
         // already fork. If the bake fails, fall back to cold-boot (clear the base
         // in both config copies so ensure hands out restore_from="").
@@ -348,17 +358,80 @@ pub const Supervisor = struct {
         os.closeFd(conn);
     }
 
-    /// Periodic pool maintenance: idle-reclaim of ready VMs and deadline sweep of
-    /// booting waiters. Deadline answers are dropped here because waiters handle
-    /// their own deadline inline (waitForOwner); the VM is kept warm regardless.
+    /// Periodic pool maintenance: reap dead children (crash-eviction), idle-
+    /// reclaim ready VMs, and deadline-sweep booting waiters. Also the shutdown
+    /// watcher: on SIGTERM/SIGINT it drains every VM's bill and exits. Deadline
+    /// answers are dropped here (waiters handle their own deadline inline in
+    /// waitForOwner); the VM is kept warm regardless.
     fn housekeep(self: *Supervisor) void {
         var answers: [pool_mod.MAX_WAITERS]pool_mod.Answer = undefined;
         while (true) {
             sleepMs(HOUSEKEEP_MS);
+            if (g_shutdown.load(.acquire)) {
+                self.teardownAll();
+                log.info("shutdown: signaled all VMs; exiting", .{});
+                std.c.exit(0);
+            }
             self.lock.lock();
+            self.reapDead(&answers);
             _ = self.pool.tick(nowMs(), &answers);
             self.lock.unlock();
         }
+    }
+
+    /// Reap dead child processes (WNOHANG). A VM that dies while still mapped is
+    /// an unexpected crash: evict its tenant so the next ensure re-boots. A VM we
+    /// killed intentionally (idle-reclaim / onFailed) is already inactive - we
+    /// just clear the zombie. MUST be called under self.lock.
+    fn reapDead(self: *Supervisor, answers: []pool_mod.Answer) void {
+        while (true) {
+            const w = os.reapAnyNoHang();
+            if (!w.reaped) break;
+            for (&self.vms) |*v| {
+                if (v.pid == w.pid and v.pid != 0) {
+                    if (v.active) {
+                        log.warn("vm={x} exited unexpectedly (code={d}); evicting", .{ v.vm_id, w.exit_code });
+                        _ = self.pool.onExited(v.vm_id, answers);
+                    }
+                    v.* = .{}; // tracking slot free; pid reaped
+                    break;
+                }
+            }
+        }
+    }
+
+    /// SIGTERM every owned VM so nether drains its final-usage bill on the way
+    /// out. Best-effort graceful teardown; takes the lock itself.
+    fn teardownAll(self: *Supervisor) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: u32 = 0;
+        for (&self.vms) |*v| {
+            if (v.active) {
+                os.killPid(v.pid, os.SIGTERM);
+                n += 1;
+            }
+        }
+        if (n > 0) log.info("teardown: SIGTERM sent to {d} VM(s)", .{n});
+    }
+
+    /// Install SIGTERM/SIGINT handlers that flip the shutdown flag the
+    /// housekeeping thread watches. SIGPIPE is ignored so a swerver connection
+    /// closing mid-write never kills the supervisor.
+    fn installSignals() void {
+        const sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleShutdownSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+        const ign = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &ign, null);
     }
 };
 
