@@ -65,7 +65,7 @@ pub const Config = struct {
     base_snap: []const u8 = "", // empty => cold-boot
     app_port: u16 = 8080,
     cpus: u16 = 1,
-    ram_mb: u32 = 256,
+    ram_mb: u32 = 512, // >= 384 floor (256 panics on rootfs mount); see config.zig
     idle_timeout_s: u32 = 90,
     idle_ttl_ms: u64 = 60_000,
     max_vms: u32 = 16,

@@ -33,7 +33,10 @@ pub const Config = struct {
     // Scalars.
     app_port: u16 = 8080,
     cpus: u16 = 1,
-    ram_mb: u32 = 256,
+    // >= 384 is the floor: nether places the ~64 MiB runtime initramfs at the
+    // ~192 MiB offset, so 256 leaves no room to mount the rootfs and the guest
+    // panics ("VFS: Unable to mount root fs"). 512 for headroom (per NETHER).
+    ram_mb: u32 = 512,
     max_vms: u32 = 16,
     idle_ttl_ms: u64 = 60_000,
     idle_timeout_s: u32 = 90,
