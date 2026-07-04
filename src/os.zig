@@ -43,6 +43,17 @@ pub fn symlinkForceZ(target: [*:0]const u8, link: [*:0]const u8) void {
     _ = std.c.symlink(target, link);
 }
 
+/// Unlink a path given as a slice (best-effort; ignores "not found"). Used to
+/// clear a stale VM socket left by a prior crashed run before nether re-binds
+/// it, so a restart does not hit EADDRINUSE.
+pub fn unlinkPath(path: []const u8) void {
+    var buf: [SUN_PATH_MAX + 16]u8 = undefined;
+    if (path.len + 1 > buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    _ = std.c.unlink(@ptrCast(&buf));
+}
+
 /// Write `data` to `path` (create/truncate). Resolved relative to cwd (or
 /// absolute). Uses openat(AT.FDCWD) since std.fs.cwd is gone in 0.16.
 pub fn writeFile(path: []const u8, data: []const u8) !void {

@@ -63,6 +63,13 @@ pub const RealLauncher = struct {
     /// `restore_from` empty => cold boot; non-empty => fork from that snapshot.
     fn spawn(self: *const RealLauncher, id: u32, control_socket: []const u8, data_socket: []const u8, restore_from: []const u8) Error!std.c.pid_t {
         const is_fork = restore_from.len > 0;
+
+        // Clear stale sockets a prior crashed run may have left at these paths
+        // (vm ids reset per process, so a restart reuses them) - nether would
+        // otherwise fail to bind.
+        os.unlinkPath(control_socket);
+        os.unlinkPath(data_socket);
+
         var cwd_buf: [512]u8 = undefined;
         const cwd = std.fmt.bufPrintZ(&cwd_buf, "{s}/{x:0>8}", .{ self.work_root, id }) catch return error.PathTooLong;
 
