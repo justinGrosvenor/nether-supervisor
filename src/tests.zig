@@ -4,4 +4,5 @@
 comptime {
     _ = @import("config.zig");
     _ = @import("log.zig");
+    _ = @import("proto.zig");
 }
