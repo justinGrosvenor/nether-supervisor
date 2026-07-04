@@ -17,6 +17,7 @@ const launcher_mod = @import("launcher.zig");
 const boot = @import("boot.zig");
 const control_client = @import("control_client.zig");
 const control_server = @import("control_server.zig");
+const status = @import("status.zig");
 const log = @import("log.zig");
 const Lock = @import("lock.zig").Lock;
 
@@ -58,6 +59,9 @@ pub const Supervisor = struct {
     /// Guards the pool + the vms[] bring-up-owner claim across connection
     /// threads and the housekeeping thread. Held only for state transitions.
     lock: Lock = .{},
+    /// The optional /status + /metrics surface (lives here so its thread has a
+    /// stable pointer). Only initialized + started when status_addr is set.
+    status_server: status.Server = undefined,
 
     /// Reserved vm id for the transient base VM (the pool issues ids from 1).
     const BASE_ID: u32 = 0;
@@ -145,6 +149,52 @@ pub const Supervisor = struct {
     fn nowMs() u64 {
         const ts = os.monotonicMs();
         return ts;
+    }
+
+    /// A consistent snapshot of the pool gauges for the status surface. Takes the
+    /// lock so counts + counters are read atomically w.r.t. state transitions.
+    fn snapshotGauges(self: *Supervisor) status.Gauges {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return .{
+            .vms_warm = self.pool.warmCount(),
+            .vms_booting = self.pool.bootingCount(),
+            .ensures = self.pool.ensures,
+            .hits = self.pool.hits,
+            .misses = self.pool.misses,
+            .reclaims = self.pool.reclaims,
+            .evictions = self.pool.evictions,
+            .boot_failures = self.pool.boot_failures,
+        };
+    }
+
+    /// Provider callback for status.Server (casts the ctx back to *Supervisor).
+    fn statusSnapshot(ctx: *anyopaque) status.Gauges {
+        const self: *Supervisor = @ptrCast(@alignCast(ctx));
+        return self.snapshotGauges();
+    }
+
+    /// Start the /status + /metrics surface on its own thread when configured.
+    /// Parses status_addr as ip:port; a malformed addr disables it (logged).
+    fn startStatus(self: *Supervisor) void {
+        if (self.cfg.status_addr.len == 0) return;
+        const colon = std.mem.lastIndexOfScalar(u8, self.cfg.status_addr, ':') orelse {
+            log.err("status_addr '{s}' missing :port; status surface off", .{self.cfg.status_addr});
+            return;
+        };
+        const port = std.fmt.parseInt(u16, self.cfg.status_addr[colon + 1 ..], 10) catch {
+            log.err("status_addr '{s}' has a bad port; status surface off", .{self.cfg.status_addr});
+            return;
+        };
+        self.status_server = .{
+            .ip = self.cfg.status_addr[0..colon],
+            .port = port,
+            .service_key = self.cfg.status_service_key,
+            .provider = .{ .ctx = self, .snapshot = statusSnapshot },
+        };
+        if (std.Thread.spawn(.{}, status.Server.run, .{&self.status_server})) |t| {
+            t.detach();
+        } else |e| log.warn("status thread not started: {s}", .{@errorName(e)});
     }
 
     /// Handle one `ensure <tenant>`. Warm HIT or immediate reject answer inline.
@@ -334,10 +384,12 @@ pub const Supervisor = struct {
         self.listen_fd = try os.listenUnix(self.cfg.control_socket);
         log.info("north control socket listening at {s}", .{self.cfg.control_socket});
 
-        // Housekeeping thread: idle-reclaim ready VMs + sweep expired waiters.
+        // Housekeeping thread: reap + idle-reclaim + waiter-deadline sweep.
         if (std.Thread.spawn(.{}, housekeep, .{self})) |t| t.detach() else |e| {
             log.warn("housekeeping thread not started: {s}", .{@errorName(e)});
         }
+        // Optional observability surface (/status + /metrics).
+        self.startStatus();
 
         // One thread per north connection so a slow cold boot on one tenant never
         // blocks ensures on another (the pool dedupes same-tenant boots).

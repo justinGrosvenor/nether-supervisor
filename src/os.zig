@@ -153,6 +153,48 @@ pub fn listenUnix(path: []const u8) ListenError!posix.fd_t {
     return fd;
 }
 
+pub const TcpError = error{ BadAddress, SocketFailed, BindFailed, ListenFailed };
+
+/// Parse a dotted-quad IPv4 string into a host-order u32. Returns null on any
+/// malformed octet (too many parts, >255, non-digit).
+pub fn parseIpv4(ip: []const u8) ?u32 {
+    var addr: u32 = 0;
+    var parts: usize = 0;
+    var it = std.mem.splitScalar(u8, ip, '.');
+    while (it.next()) |part| {
+        if (parts >= 4 or part.len == 0 or part.len > 3) return null;
+        const octet = std.fmt.parseInt(u8, part, 10) catch return null;
+        addr = (addr << 8) | octet;
+        parts += 1;
+    }
+    if (parts != 4) return null;
+    return addr;
+}
+
+/// Bind + listen a TCP socket at `ip:port` (SO_REUSEADDR). Returns the listening
+/// fd. Used by the optional status/metrics surface; loopback-only in practice.
+pub fn listenTcp(ip: []const u8, port: u16) TcpError!posix.fd_t {
+    const host_addr = parseIpv4(ip) orelse return error.BadAddress;
+    const domain: c_uint = @intCast(posix.AF.INET);
+    const rc = posix.system.socket(domain, posix.SOCK.STREAM, 0);
+    if (rc < 0) return error.SocketFailed;
+    const fd: posix.fd_t = @intCast(rc);
+    errdefer closeFd(fd);
+
+    const one: c_int = 1;
+    _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
+
+    var sa: posix.sockaddr.in = .{
+        .family = @intCast(posix.AF.INET),
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, host_addr),
+        .zero = [_]u8{0} ** 8,
+    };
+    if (posix.system.bind(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) != 0) return error.BindFailed;
+    if (posix.system.listen(fd, 16) != 0) return error.ListenFailed;
+    return fd;
+}
+
 /// Accept one connection (blocking). Returns the connected fd.
 pub fn acceptConn(listen_fd: posix.fd_t) error{AcceptFailed}!posix.fd_t {
     const rc = posix.system.accept(listen_fd, null, null);

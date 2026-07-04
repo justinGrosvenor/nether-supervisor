@@ -15,5 +15,6 @@ comptime {
     _ = @import("pool.zig");
     _ = @import("readiness.zig");
     _ = @import("boot.zig");
+    _ = @import("status.zig");
     _ = @import("supervisor.zig");
 }
