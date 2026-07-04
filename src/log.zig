@@ -2,18 +2,25 @@
 //! component. Writes to stderr, line-buffered per call. No dependencies.
 
 const std = @import("std");
+const Lock = @import("lock.zig").Lock;
 
-// NOTE: single-writer for now (Phase 0 is single-threaded). When the reactor +
-// bring-up threads land (Phase 3), wrap emit() in a mutex so interleaved log
-// lines from worker threads stay whole.
+// One writer at a time: the north connection threads + the housekeeping thread
+// all log concurrently, so serialize each whole line (format off-lock, then take
+// the lock only for the single write).
+var emit_lock: Lock = .{};
+
 fn emit(comptime level: []const u8, comptime fmt: []const u8, args: anytype) void {
     var buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "[nsup] " ++ level ++ " " ++ fmt ++ "\n", args) catch {
         // Message too long for the stack buffer: emit a truncation marker
         // rather than dropping it silently.
+        emit_lock.lock();
+        defer emit_lock.unlock();
         std.debug.print("[nsup] " ++ level ++ " <log line too long>\n", .{});
         return;
     };
+    emit_lock.lock();
+    defer emit_lock.unlock();
     std.debug.print("{s}", .{line});
 }
 

@@ -1,9 +1,11 @@
 //! Wires the RealLauncher to the pool state machine and runs the north control
-//! loop. For the validation gate the bring-up is SYNCHRONOUS (one VM at a time,
-//! inline on the accept loop): on `ensure <tenant>` the pool spawns a cold VM,
-//! we drive it to serving, then answer. The async bring-up thread + poll reactor
-//! (so the north loop never blocks) is the next increment; the pool state
-//! machine underneath is already the real one.
+//! loop. Bring-up is ASYNC: the north accept loop spawns one thread per swerver
+//! connection, so a multi-second cold boot on one tenant never blocks ensures on
+//! another. Concurrent ensures for the SAME cold tenant dedupe to one boot - the
+//! first caller becomes the bring-up owner (drives the VM to serving off-lock);
+//! the rest poll the pool until the owner marks it ready. A spinlock guards the
+//! pool + the owner claim (held only for the microsecond state transitions; the
+//! slow I/O runs outside it). A housekeeping thread ticks idle-reclaim/deadline.
 
 const std = @import("std");
 const c = std.c;
@@ -16,6 +18,12 @@ const boot = @import("boot.zig");
 const control_client = @import("control_client.zig");
 const control_server = @import("control_server.zig");
 const log = @import("log.zig");
+const Lock = @import("lock.zig").Lock;
+
+/// Housekeeping cadence: idle-reclaim + waiter-deadline sweep.
+const HOUSEKEEP_MS: u64 = 250;
+/// Waiter poll interval while its bring-up owner drives the boot.
+const WAITER_POLL_MS: u64 = 10;
 
 /// Tracks a spawned VM process so the launcher can kill it and bring-up can find
 /// its sockets. Indexed alongside pool slots by vm_id.
@@ -23,6 +31,9 @@ const VmProc = struct {
     active: bool = false,
     vm_id: u32 = 0,
     pid: c.pid_t = 0,
+    /// Set once when a connection thread claims the bring-up for this VM, so
+    /// concurrent ensures for the same cold tenant produce exactly one driver.
+    bringup_started: bool = false,
 };
 
 pub const Supervisor = struct {
@@ -36,6 +47,9 @@ pub const Supervisor = struct {
     /// snapshot into the base VM cwd, so the real fork source is derived, not
     /// the config value). cfg/pool base_snap slices point in here after bake.
     base_snap_buf: [512]u8 = undefined,
+    /// Guards the pool + the vms[] bring-up-owner claim across connection
+    /// threads and the housekeeping thread. Held only for state transitions.
+    lock: Lock = .{},
 
     /// Reserved vm id for the transient base VM (the pool issues ids from 1).
     const BASE_ID: u32 = 0;
@@ -106,60 +120,116 @@ pub const Supervisor = struct {
         }
     }
 
+    /// Claim the bring-up for `vm_id`. Returns true for exactly the first caller
+    /// (the owner, which drives the boot); false for later callers (waiters, who
+    /// poll). MUST be called under self.lock.
+    fn claimBringup(self: *Supervisor, vm_id: u32) bool {
+        for (&self.vms) |*v| {
+            if (v.active and v.vm_id == vm_id) {
+                if (v.bringup_started) return false;
+                v.bringup_started = true;
+                return true;
+            }
+        }
+        return false; // untracked: treat as non-owner (defensive)
+    }
+
     fn nowMs() u64 {
         const ts = os.monotonicMs();
         return ts;
     }
 
-    /// Handle one `ensure <tenant>` synchronously: pool.ensure, then (on a MISS)
-    /// drive the just-spawned VM to serving and resolve. Writes the framed reply
-    /// into `out`.
+    /// Handle one `ensure <tenant>`. Warm HIT or immediate reject answer inline.
+    /// On a cold MISS the caller either OWNS the boot (drives the VM to serving
+    /// off-lock, then answers) or WAITS (polls the pool until the owner resolves
+    /// it), so N concurrent ensures for one cold tenant share a single boot and
+    /// the north loop is never blocked. Writes the framed reply into `out`.
     fn handleEnsure(self: *Supervisor, tenant: []const u8, out: []u8) []const u8 {
+        const now = nowMs();
+        const deadline = now + self.cfg.boot_budget_ms;
+
+        self.lock.lock();
         const waiter = self.next_waiter;
         self.next_waiter += 1;
-        const now = nowMs();
-        const outcome = self.pool.ensure(tenant, waiter, now, now + self.cfg.boot_budget_ms);
+        const outcome = self.pool.ensure(tenant, waiter, now, deadline);
         switch (outcome) {
             .hit => |path| {
-                log.info("ensure {s}: HIT {s}", .{ tenant, path });
-                return proto.buildReply(out, path, 0) catch out[0..0];
+                const r = proto.buildReply(out, path, 0) catch out[0..0];
+                self.lock.unlock();
+                log.info("ensure {s}: HIT", .{tenant});
+                return r;
             },
             .rejected => |reason| {
+                const r = proto.buildReply(out, reason, 1) catch out[0..0];
+                self.lock.unlock();
                 log.warn("ensure {s}: rejected ({s})", .{ tenant, reason });
-                return proto.buildReply(out, reason, 1) catch out[0..0];
+                return r;
             },
             .parked => {},
         }
 
-        // MISS: a VM was spawned. Drive it to serving synchronously.
+        // Parked on a booting VM. Copy its sockets + decide ownership under lock;
+        // the slot buffers can be reclaimed once we release it.
         const info = self.pool.bootingInfo(tenant) orelse {
+            self.lock.unlock();
             return proto.buildReply(out, "no booting vm", 1) catch out[0..0];
         };
+        var ctl_buf: [os.SUN_PATH_MAX]u8 = undefined;
+        var data_buf: [os.SUN_PATH_MAX]u8 = undefined;
+        @memcpy(ctl_buf[0..info.control_socket.len], info.control_socket);
+        @memcpy(data_buf[0..info.data_socket.len], info.data_socket);
+        const ctl = ctl_buf[0..info.control_socket.len];
+        const data = data_buf[0..info.data_socket.len];
+        const vm_id = info.vm_id;
+        const owner = self.claimBringup(vm_id);
+        self.lock.unlock();
+
+        if (owner) return self.driveOwner(tenant, vm_id, ctl, data, out);
+        return self.waitForOwner(tenant, deadline, out);
+    }
+
+    /// Bring-up OWNER: drive the just-spawned VM to serving off-lock, then flip
+    /// the pool to ready (which also answers any waiters) and reply.
+    fn driveOwner(self: *Supervisor, tenant: []const u8, vm_id: u32, ctl: []const u8, data: []const u8, out: []u8) []const u8 {
         const is_fork = self.cfg.base_snap.len > 0;
-        log.info("ensure {s}: {s} vm={x} (control={s})", .{ tenant, if (is_fork) "fork" else "cold boot", info.vm_id, info.control_socket });
+        log.info("ensure {s}: {s} vm={x}", .{ tenant, if (is_fork) "fork" else "cold boot", vm_id });
 
         var answers: [pool_mod.MAX_WAITERS]pool_mod.Answer = undefined;
-        boot.bringUp(info.control_socket, info.data_socket, is_fork, self.cfg.boot_budget_ms, nowMs) catch |e| {
+        boot.bringUp(ctl, data, is_fork, self.cfg.boot_budget_ms, nowMs) catch |e| {
             log.err("ensure {s}: bring-up failed: {s}", .{ tenant, @errorName(e) });
-            _ = self.pool.onFailed(info.vm_id, "bring-up failed", &answers);
+            self.lock.lock();
+            _ = self.pool.onFailed(vm_id, "bring-up failed", &answers);
+            self.lock.unlock();
             return proto.buildReply(out, "cold start failed", 1) catch out[0..0];
         };
 
-        const n = self.pool.onReady(info.vm_id, info.data_socket, nowMs(), &answers);
-        // Find this waiter's answer (there is exactly one for a fresh boot).
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (answers[i].waiter_id == waiter) {
-                switch (answers[i].result) {
-                    .ok => |path| {
-                        log.info("ensure {s}: SERVING {s}", .{ tenant, path });
-                        return proto.buildReply(out, path, 0) catch out[0..0];
-                    },
-                    .fail => |reason| return proto.buildReply(out, reason, 1) catch out[0..0],
-                }
+        self.lock.lock();
+        _ = self.pool.onReady(vm_id, data, nowMs(), &answers);
+        const r = proto.buildReply(out, data, 0) catch out[0..0];
+        self.lock.unlock();
+        log.info("ensure {s}: SERVING vm={x}", .{ tenant, vm_id });
+        return r;
+    }
+
+    /// Bring-up WAITER: another connection owns this tenant's boot. Poll the pool
+    /// until it goes ready (reply the path), the boot fails/evicts (fail closed),
+    /// or our deadline passes (fail; the VM stays warm so the retry HITs).
+    fn waitForOwner(self: *Supervisor, tenant: []const u8, deadline: u64, out: []u8) []const u8 {
+        while (true) {
+            sleepMs(WAITER_POLL_MS);
+            self.lock.lock();
+            var pbuf: [os.SUN_PATH_MAX]u8 = undefined;
+            if (self.pool.readyPath(tenant, &pbuf)) |p| {
+                const r = proto.buildReply(out, p, 0) catch out[0..0];
+                self.lock.unlock();
+                log.info("ensure {s}: SERVING (waited)", .{tenant});
+                return r;
             }
+            const still_booting = self.pool.isBooting(tenant);
+            self.lock.unlock();
+            if (!still_booting) return proto.buildReply(out, "cold start failed", 1) catch out[0..0];
+            if (nowMs() > deadline) return proto.buildReply(out, "cold start timed out", 1) catch out[0..0];
         }
-        return proto.buildReply(out, "internal", 1) catch out[0..0];
     }
 
     /// One north connection: read lines, dispatch, reply, until EOF.
@@ -253,10 +323,46 @@ pub const Supervisor = struct {
 
         self.listen_fd = try os.listenUnix(self.cfg.control_socket);
         log.info("north control socket listening at {s}", .{self.cfg.control_socket});
+
+        // Housekeeping thread: idle-reclaim ready VMs + sweep expired waiters.
+        if (std.Thread.spawn(.{}, housekeep, .{self})) |t| t.detach() else |e| {
+            log.warn("housekeeping thread not started: {s}", .{@errorName(e)});
+        }
+
+        // One thread per north connection so a slow cold boot on one tenant never
+        // blocks ensures on another (the pool dedupes same-tenant boots).
         while (true) {
             const conn = os.acceptConn(self.listen_fd) catch continue;
-            self.serveConn(conn);
-            os.closeFd(conn);
+            if (std.Thread.spawn(.{}, connThread, .{ self, conn })) |t| {
+                t.detach();
+            } else |e| {
+                log.err("conn thread spawn failed: {s}; closing", .{@errorName(e)});
+                os.closeFd(conn);
+            }
+        }
+    }
+
+    /// Per-connection worker: serve the connection to EOF, then close it.
+    fn connThread(self: *Supervisor, conn: std.posix.fd_t) void {
+        self.serveConn(conn);
+        os.closeFd(conn);
+    }
+
+    /// Periodic pool maintenance: idle-reclaim of ready VMs and deadline sweep of
+    /// booting waiters. Deadline answers are dropped here because waiters handle
+    /// their own deadline inline (waitForOwner); the VM is kept warm regardless.
+    fn housekeep(self: *Supervisor) void {
+        var answers: [pool_mod.MAX_WAITERS]pool_mod.Answer = undefined;
+        while (true) {
+            sleepMs(HOUSEKEEP_MS);
+            self.lock.lock();
+            _ = self.pool.tick(nowMs(), &answers);
+            self.lock.unlock();
         }
     }
 };
+
+fn sleepMs(ms: u64) void {
+    var req = std.posix.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = std.c.nanosleep(&req, null);
+}

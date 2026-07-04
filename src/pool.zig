@@ -122,6 +122,30 @@ pub const Pool = struct {
         return null;
     }
 
+    /// If `tenant` maps to a READY vm, copy its data_socket into `out` and return
+    /// the copy. A waiter thread polls this after its owner drives bring-up; the
+    /// copy is taken under the caller's lock so the slot buffer can be reclaimed
+    /// safely afterward.
+    pub fn readyPath(self: *Pool, name: []const u8, out: []u8) ?[]const u8 {
+        if (self.findByTenant(name)) |s| {
+            if (s.state == .ready) {
+                const d = s.dataSocket();
+                if (d.len > out.len) return null;
+                @memcpy(out[0..d.len], d);
+                return out[0..d.len];
+            }
+        }
+        return null;
+    }
+
+    /// True while `tenant` still has a booting VM (its bring-up owner is in
+    /// flight). A polling waiter uses this to distinguish "still coming" from
+    /// "boot failed / evicted" (fail closed).
+    pub fn isBooting(self: *Pool, name: []const u8) bool {
+        if (self.findByTenant(name)) |s| return s.state == .booting;
+        return false;
+    }
+
     pub fn bootingCount(self: *const Pool) u32 {
         var n: u32 = 0;
         for (&self.slots) |*s| {

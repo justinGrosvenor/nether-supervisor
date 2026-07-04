@@ -3,6 +3,7 @@
 
 comptime {
     _ = @import("config.zig");
+    _ = @import("lock.zig");
     _ = @import("log.zig");
     _ = @import("os.zig");
     _ = @import("proto.zig");
