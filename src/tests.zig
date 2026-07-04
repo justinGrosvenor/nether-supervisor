@@ -8,4 +8,6 @@ comptime {
     _ = @import("proto.zig");
     _ = @import("control_reader.zig");
     _ = @import("control_client.zig");
+    _ = @import("control_server.zig");
+    _ = @import("vm.zig");
 }
