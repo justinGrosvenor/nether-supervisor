@@ -10,6 +10,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const os = @import("os.zig");
 const log = @import("log.zig");
+const Supervisor = @import("supervisor.zig").Supervisor;
 
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
@@ -38,15 +39,22 @@ pub fn main() !void {
         return e;
     };
 
-    log.info("config loaded: control_socket={s} socket_dir={s} launcher={s} max_vms={d} base_snap={s}", .{
+    log.info("config loaded: control_socket={s} socket_dir={s} nether_bin={s} kernels={s} max_vms={d} ram_mb={d} base_snap={s}", .{
         cfg.control_socket,
         cfg.socket_dir,
-        cfg.launcher_mode,
+        cfg.nether_bin,
+        cfg.kernels_dir,
         cfg.max_vms,
+        cfg.ram_mb,
         if (cfg.base_snap.len == 0) "(cold-boot)" else cfg.base_snap,
     });
 
-    // Phase 0 stops here: the reactor + pool land in later phases. Exit clean so
-    // the scaffold is runnable (`zig build run -- nether-supervisor.conf`).
-    log.info("scaffold ready (reactor not yet wired; see the plan build order)", .{});
+    // Ensure the socket + work directories exist before binding/spawning.
+    os.mkdirPath(cfg.socket_dir);
+    os.mkdirPath(cfg.work_root);
+
+    // Run the supervisor (binds the north control socket, serves ensure).
+    var sup = Supervisor.init(cfg);
+    sup.wire();
+    try sup.run();
 }

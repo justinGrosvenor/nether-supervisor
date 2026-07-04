@@ -107,6 +107,21 @@ pub const Pool = struct {
         return n;
     }
 
+    pub const VmInfo = struct { vm_id: u32, control_socket: []const u8, data_socket: []const u8 };
+
+    /// The booting VM currently mapped to `tenant`, if any. Used by the reactor
+    /// (or the synchronous gate) to drive bring-up on the just-spawned VM.
+    pub fn bootingInfo(self: *Pool, name: []const u8) ?VmInfo {
+        if (self.findByTenant(name)) |s| {
+            if (s.state == .booting) return .{
+                .vm_id = s.vm_id,
+                .control_socket = s.control_buf[0..s.control_len],
+                .data_socket = s.data_buf[0..s.data_len],
+            };
+        }
+        return null;
+    }
+
     pub fn bootingCount(self: *const Pool) u32 {
         var n: u32 = 0;
         for (&self.slots) |*s| {
