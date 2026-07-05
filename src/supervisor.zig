@@ -334,12 +334,29 @@ pub const Supervisor = struct {
     /// serving, `__snapshot__` it to cfg.base_snap, then shut it down. Per-tenant
     /// ensures then fork from that snapshot (~76ms) instead of full cold boots.
     /// The base is NOT tracked in self.vms (it is transient and reaped here).
+    /// Remove stale artifacts in the base VM's work dir (<work_root>/00000000/)
+    /// so each bake starts pristine. spawnCold recreates the dir and its
+    /// contents; a leftover base.snap in particular must not survive.
+    fn cleanBaseDir(work_root: []const u8) void {
+        for ([_][]const u8{ "base.snap", "nether.conf", "nether.log", "kernels" }) |name| {
+            var buf: [600]u8 = undefined;
+            const path = std.fmt.bufPrint(&buf, "{s}/{x:0>8}/{s}", .{ work_root, BASE_ID, name }) catch continue;
+            os.unlinkPath(path);
+        }
+    }
+
     fn bakeBase(self: *Supervisor) !void {
         var cbuf: [os.SUN_PATH_MAX + 32]u8 = undefined;
         var dbuf: [os.SUN_PATH_MAX + 32]u8 = undefined;
         const p = try @import("vm.zig").socketPaths(self.cfg.socket_dir, "base", &cbuf, &dbuf);
 
         log.info("baking warm-fork base (id={x:0>8})", .{BASE_ID});
+        // Start the base from a CLEAN dir. A stale base.snap / conf / kernels
+        // symlink / log left by a prior run (or a run with a mismatched nether
+        // binary) can otherwise yield a base whose forks misbehave (e.g. hang on
+        // shell exec while the data plane still serves). spawnCold recreates the
+        // conf + kernels symlink; the base then writes a fresh base.snap.
+        cleanBaseDir(self.cfg.work_root);
         const pid = try self.real.spawnCold(BASE_ID, p.control, p.data);
         errdefer os.killPid(pid, os.SIGTERM);
 
