@@ -114,7 +114,11 @@ pub fn buildReply(out: []u8, body: []const u8, exit: u8) error{NoSpace}![]u8 {
     return out[0 .. n + trailer.len];
 }
 
-/// Verify a __info__ report carries `proto_version=1`.
+/// Verify a __info__ report carries a supported `proto_version` (1 or 2). v2
+/// frames every ack (removing the v1 bare/framed ambiguity); the supervisor's
+/// drive() already reads framed replies, so it interoperates with either. The
+/// reply reader is v1-shaped and works against a v2 server (framed acks parse
+/// transparently, bare-line handling simply never triggers).
 pub fn verifyProtoVersion(report: []const u8) bool {
     const key = "proto_version=";
     const at = std.mem.indexOf(u8, report, key) orelse return false;
@@ -125,16 +129,17 @@ pub fn verifyProtoVersion(report: []const u8) bool {
         n = n * 10 + (report[i] - '0');
         saw_digit = true;
     }
-    return saw_digit and n == 1;
+    return saw_digit and (n == 1 or n == 2);
 }
 
 // ── Tests (ported from swerver control_client.zig + new codec tests) ──────
 
 const testing = std.testing;
 
-test "verifyProtoVersion accepts v1, rejects others" {
+test "verifyProtoVersion accepts v1 and v2, rejects others" {
     try testing.expect(verifyProtoVersion("nether sandbox info\nproto_version=1\nbackend=hvf\n"));
-    try testing.expect(!verifyProtoVersion("nether sandbox info\nproto_version=2\n"));
+    try testing.expect(verifyProtoVersion("nether sandbox info\nproto_version=2\nbackend=hvf\n"));
+    try testing.expect(!verifyProtoVersion("nether sandbox info\nproto_version=3\n"));
     try testing.expect(!verifyProtoVersion("nether sandbox info\n"));
     try testing.expect(!verifyProtoVersion("proto_version=\n"));
     try testing.expect(verifyProtoVersion("proto_version=1"));

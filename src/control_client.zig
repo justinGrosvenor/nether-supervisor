@@ -99,12 +99,22 @@ test "handshake verifies proto_version=1" {
     try testing.expect(proto.verifyProtoVersion(report));
 }
 
-test "handshake rejects a wrong proto_version" {
+test "handshake accepts proto_version 2 (framed acks; drive is v2-tolerant)" {
     const fds = try pair();
     defer os.closeFd(fds[1]);
     var client = Client{ .fd = fds[0] };
     defer client.close();
-    try os.writeAll(fds[1], "info\nproto_version=2\n\x1e0\n");
+    try os.writeAll(fds[1], "nether sandbox info\nproto_version=2\nbackend=fake\n\x1e0\n");
+    const report = try client.handshake(.{ .hang_ms = 200 });
+    try testing.expect(proto.verifyProtoVersion(report));
+}
+
+test "handshake rejects an unsupported proto_version" {
+    const fds = try pair();
+    defer os.closeFd(fds[1]);
+    var client = Client{ .fd = fds[0] };
+    defer client.close();
+    try os.writeAll(fds[1], "info\nproto_version=9\n\x1e0\n");
     try testing.expectError(error.ProtoMismatch, client.handshake(.{ .hang_ms = 200 }));
 }
 
