@@ -3,9 +3,11 @@
 //! MockLauncher is its unit-test stand-in). The bring-up sequence is the recipe
 //! proven by nether's scripts/fork_serve.py:
 //!   boot -> __info__ (proto_version=1) -> `echo ready` until the agent answers
-//!   -> drive SRV (start the in-guest HTTP server on app_port) -> probe the
-//!   data_socket over HTTP until it serves.
-//! A fork (restore) inherits the running server, so SRV is skipped for forks.
+//!   -> optionally drive SRV (start the built-in in-guest HTTP server on
+//!   app_port) -> probe the data_socket over HTTP until it serves.
+//! A fork inherits a data plane already proven before snapshot. Its successful
+//! control handshake is the restore barrier; consuming an HTTP request as a
+//! second readiness probe would mutate a one-shot guest before the real request.
 
 const std = @import("std");
 const os = @import("os.zig");
@@ -132,11 +134,30 @@ pub const RealLauncher = struct {
 
 pub const BringUpError = error{ Connect, Handshake, AgentTimeout, ServerStart, NotServing };
 
-/// Drive a booted VM to a serving state. `is_fork` skips the SRV server-start
-/// (a fork inherits the running server). Blocks up to `budget_ms`. On success
-/// the data_socket serves HTTP.
-pub fn bringUp(control_socket: []const u8, data_socket: []const u8, is_fork: bool, budget_ms: u64, now_fn: *const fn () u64) BringUpError!void {
+pub const ServiceActions = struct {
+    wait_for_agent: bool,
+    start_builtin: bool,
+    probe_data: bool,
+};
+
+/// Make the warm-fork contract explicit and unit-testable. Cold bases must prove
+/// the full data path before snapshot. Restored forks only handshake: probing
+/// their data path would consume the first request of a one-shot workload.
+pub fn serviceActions(is_fork: bool, guest_service_prestarted: bool) ServiceActions {
+    if (is_fork) return .{ .wait_for_agent = false, .start_builtin = false, .probe_data = false };
+    return .{
+        .wait_for_agent = true,
+        .start_builtin = !guest_service_prestarted,
+        .probe_data = true,
+    };
+}
+
+/// Drive a booted VM to a serving state. A cold base waits for the agent,
+/// optionally starts the built-in service, and proves HTTP before snapshot. A
+/// restored fork returns after its control handshake. Blocks up to `budget_ms`.
+pub fn bringUp(control_socket: []const u8, data_socket: []const u8, is_fork: bool, guest_service_prestarted: bool, budget_ms: u64, now_fn: *const fn () u64) BringUpError!void {
     const deadline = now_fn() + budget_ms;
+    const actions = serviceActions(is_fork, guest_service_prestarted);
 
     // 1. Connect the control socket (it may not exist yet; retry).
     var client: control_client.Client = while (now_fn() < deadline) {
@@ -149,8 +170,8 @@ pub fn bringUp(control_socket: []const u8, data_socket: []const u8, is_fork: boo
     // 2. Handshake: __info__ + proto_version=1.
     _ = client.handshake(.{ .hang_ms = 2000 }) catch return error.Handshake;
 
-    if (!is_fork) {
-        // 3. Wait for the guest agent (echo round-trips), then start the server.
+    if (actions.wait_for_agent) {
+        // 3. Wait for the guest agent (echo round-trips).
         while (now_fn() < deadline) {
             const r = client.drive("echo ready", .{ .settle_ms = 200, .hang_ms = 1500 }) catch {
                 sleepMs(50);
@@ -159,13 +180,17 @@ pub fn bringUp(control_socket: []const u8, data_socket: []const u8, is_fork: boo
             if (r.framed and std.mem.indexOf(u8, r.body, "ready") != null) break;
             sleepMs(50);
         } else return error.AgentTimeout;
+    }
 
-        // 4. Start the in-guest HTTP server on app_port.
+    if (actions.start_builtin) {
+        // 4. Start the built-in in-guest HTTP server on app_port.
         const s = client.drive(SRV, .{ .hang_ms = 3000 }) catch return error.ServerStart;
         if (!s.framed) return error.ServerStart;
     }
 
-    // 5. Probe the data_socket over HTTP until it serves (connect is not enough).
+    if (!actions.probe_data) return;
+
+    // 5. Cold base only: prove the complete data path before snapshot.
     while (now_fn() < deadline) {
         readiness.probeOnce(data_socket) catch {
             sleepMs(30);
@@ -185,4 +210,23 @@ test {
     // Compile-time reference so the module type-checks in `zig build test`; the
     // live boot is exercised by the gate script (needs real nether + HVF).
     std.testing.refAllDecls(@This());
+}
+
+test "service actions preserve the first restored-fork request" {
+    const testing = std.testing;
+
+    const builtin_cold = serviceActions(false, false);
+    try testing.expect(builtin_cold.wait_for_agent);
+    try testing.expect(builtin_cold.start_builtin);
+    try testing.expect(builtin_cold.probe_data);
+
+    const prestarted_cold = serviceActions(false, true);
+    try testing.expect(prestarted_cold.wait_for_agent);
+    try testing.expect(!prestarted_cold.start_builtin);
+    try testing.expect(prestarted_cold.probe_data);
+
+    const restored = serviceActions(true, true);
+    try testing.expect(!restored.wait_for_agent);
+    try testing.expect(!restored.start_builtin);
+    try testing.expect(!restored.probe_data);
 }

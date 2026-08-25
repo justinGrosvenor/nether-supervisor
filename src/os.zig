@@ -13,6 +13,23 @@ pub fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
+/// Keep supervisor-owned descriptors out of exec'd nether children. The daemon
+/// forks while north/status connection threads are live; without FD_CLOEXEC,
+/// every VM inherits those listeners and client connections until it exits.
+pub fn setCloseOnExec(fd: posix.fd_t) error{CloexecFailed}!void {
+    while (true) {
+        const rc = posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC));
+        if (rc >= 0) return;
+        if (posix.errno(rc) == .INTR) continue;
+        return error.CloexecFailed;
+    }
+}
+
+pub fn isCloseOnExec(fd: posix.fd_t) bool {
+    const rc = posix.system.fcntl(fd, posix.F.GETFD, @as(usize, 0));
+    return rc >= 0 and (@as(usize, @intCast(rc)) & posix.FD_CLOEXEC) != 0;
+}
+
 pub const UnixError = error{ PathTooLong, SocketFailed, ConnectFailed };
 
 /// Connect to a UNIX-domain stream socket (blocking). Returns the fd. The south
@@ -24,6 +41,7 @@ pub fn connectUnix(path: []const u8) UnixError!posix.fd_t {
     if (rc < 0) return error.SocketFailed;
     const fd: posix.fd_t = @intCast(rc);
     errdefer closeFd(fd);
+    setCloseOnExec(fd) catch return error.SocketFailed;
 
     var sa: posix.sockaddr.un = .{ .path = undefined };
     @memset(&sa.path, 0);
@@ -57,7 +75,9 @@ pub fn unlinkPath(path: []const u8) void {
 /// Write `data` to `path` (create/truncate). Resolved relative to cwd (or
 /// absolute). Uses openat(AT.FDCWD) since std.fs.cwd is gone in 0.16.
 pub fn writeFile(path: []const u8, data: []const u8) !void {
-    const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    var flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    const fd = try posix.openat(posix.AT.FDCWD, path, flags, 0o644);
     defer closeFd(fd);
     var off: usize = 0;
     while (off < data.len) {
@@ -129,12 +149,16 @@ pub fn mkdirPath(path: []const u8) void {
 /// open(2) helpers for the post-fork child (NUL-terminated, libc). Return the
 /// fd or error.OpenFailed.
 pub fn openReadZ(path: [*:0]const u8) error{OpenFailed}!posix.fd_t {
-    const rc = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    var flags: posix.O = .{ .ACCMODE = .RDONLY };
+    if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    const rc = std.c.open(path, flags, @as(c_uint, 0));
     if (rc < 0) return error.OpenFailed;
     return rc;
 }
 pub fn openWriteZ(path: [*:0]const u8) error{OpenFailed}!posix.fd_t {
-    const rc = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    var flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    const rc = std.c.open(path, flags, @as(c_uint, 0o644));
     if (rc < 0) return error.OpenFailed;
     return rc;
 }
@@ -155,6 +179,7 @@ pub fn listenUnix(path: []const u8) ListenError!posix.fd_t {
     if (rc < 0) return error.SocketFailed;
     const fd: posix.fd_t = @intCast(rc);
     errdefer closeFd(fd);
+    setCloseOnExec(fd) catch return error.SocketFailed;
 
     var sa: posix.sockaddr.un = .{ .path = undefined };
     @memset(&sa.path, 0);
@@ -191,6 +216,7 @@ pub fn listenTcp(ip: []const u8, port: u16) TcpError!posix.fd_t {
     if (rc < 0) return error.SocketFailed;
     const fd: posix.fd_t = @intCast(rc);
     errdefer closeFd(fd);
+    setCloseOnExec(fd) catch return error.SocketFailed;
 
     const one: c_int = 1;
     _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
@@ -210,7 +236,12 @@ pub fn listenTcp(ip: []const u8, port: u16) TcpError!posix.fd_t {
 pub fn acceptConn(listen_fd: posix.fd_t) error{AcceptFailed}!posix.fd_t {
     const rc = posix.system.accept(listen_fd, null, null);
     if (rc < 0) return error.AcceptFailed;
-    return @intCast(rc);
+    const fd: posix.fd_t = @intCast(rc);
+    setCloseOnExec(fd) catch {
+        closeFd(fd);
+        return error.AcceptFailed;
+    };
+    return fd;
 }
 
 /// Read some bytes (blocking). Returns 0 on EOF.
@@ -237,6 +268,25 @@ pub fn writeAll(fd: posix.fd_t, data: []const u8) error{WriteFailed}!void {
         if (rc == 0) return error.WriteFailed;
         sent += @intCast(rc);
     }
+}
+
+test "unix socket helpers set close-on-exec" {
+    const testing = std.testing;
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/nsup-cloexec-{d}.sock", .{std.c.getpid()});
+    unlinkPath(path);
+    defer unlinkPath(path);
+
+    const listener = try listenUnix(path);
+    defer closeFd(listener);
+    const client = try connectUnix(path);
+    defer closeFd(client);
+    const accepted = try acceptConn(listener);
+    defer closeFd(accepted);
+
+    try testing.expect(isCloseOnExec(listener));
+    try testing.expect(isCloseOnExec(client));
+    try testing.expect(isCloseOnExec(accepted));
 }
 
 /// Read an entire file (resolved relative to the process cwd) into a freshly

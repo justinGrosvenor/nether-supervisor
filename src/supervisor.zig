@@ -253,7 +253,7 @@ pub const Supervisor = struct {
         log.info("ensure {s}: {s} vm={x}", .{ tenant, if (is_fork) "fork" else "cold boot", vm_id });
 
         var answers: [pool_mod.MAX_WAITERS]pool_mod.Answer = undefined;
-        boot.bringUp(ctl, data, is_fork, self.cfg.boot_budget_ms, nowMs) catch |e| {
+        boot.bringUp(ctl, data, is_fork, self.cfg.guest_service_prestarted, self.cfg.boot_budget_ms, nowMs) catch |e| {
             log.err("ensure {s}: bring-up failed: {s}", .{ tenant, @errorName(e) });
             self.lock.lock();
             _ = self.pool.onFailed(vm_id, "bring-up failed", &answers);
@@ -361,7 +361,7 @@ pub const Supervisor = struct {
         errdefer os.killPid(pid, os.SIGTERM);
 
         // Drive the base to a serving state (starts the guest server via SRV).
-        try boot.bringUp(p.control, p.data, false, self.cfg.boot_budget_ms, nowMs);
+        try boot.bringUp(p.control, p.data, false, self.cfg.guest_service_prestarted, self.cfg.boot_budget_ms, nowMs);
 
         // Snapshot the running server + data plane, then shut the base down. The
         // snapshot blocks until the file is on disk, so a successful reply means

@@ -16,6 +16,12 @@ A two-sided broker:
   one's control socket (readiness, snapshot, shutdown), and reclaims idle VMs.
   Each VM exposes a `data_socket` that swerver proxies to as a raw HTTP upstream.
 
+The cold base is HTTP-probed before it is snapshotted. Restored forks use their
+successful control handshake as the readiness barrier, preserving the first
+guest HTTP request for the caller. Set `guest_service_prestarted = true` when
+the guest image starts its own server from `/init`; otherwise the supervisor
+starts its built-in demonstration server.
+
 swerver needs no changes: the supervisor is a drop-in for the stub plus real VM
 lifecycle.
 

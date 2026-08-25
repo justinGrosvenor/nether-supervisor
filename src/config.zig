@@ -29,6 +29,9 @@ pub const Config = struct {
     launcher_mode: []const u8 = "real", // "real" | "fake" (fake deferred)
     status_addr: []const u8 = "", // empty => status surface off
     status_service_key: []const u8 = "",
+    /// The guest image launches its HTTP service during init. When false, the
+    /// supervisor launches its built-in demo server after the agent is ready.
+    guest_service_prestarted: bool = false,
 
     // Scalars.
     app_port: u16 = 8080,
@@ -72,6 +75,13 @@ pub const Config = struct {
             self.status_addr = try self.dupe(val);
         } else if (std.mem.eql(u8, key, "status_service_key")) {
             self.status_service_key = try self.dupe(val);
+        } else if (std.mem.eql(u8, key, "guest_service_prestarted")) {
+            self.guest_service_prestarted = if (std.mem.eql(u8, val, "true"))
+                true
+            else if (std.mem.eql(u8, val, "false"))
+                false
+            else
+                return error.InvalidBoolean;
         } else if (std.mem.eql(u8, key, "app_port")) {
             self.app_port = try std.fmt.parseInt(u16, val, 10);
         } else if (std.mem.eql(u8, key, "cpus")) {
@@ -151,6 +161,7 @@ test "parseText applies keys, trims, and skips comments/blanks" {
         \\socket_dir=/run/nsup   # inline comment
         \\max_vms = 8
         \\app_port = 9090
+        \\guest_service_prestarted = true
         \\bogus_key = whatever
     ;
     const unknown = try cfg.parseText(text);
@@ -159,6 +170,7 @@ test "parseText applies keys, trims, and skips comments/blanks" {
     try testing.expectEqualStrings("/run/nsup", cfg.socket_dir);
     try testing.expectEqual(@as(u32, 8), cfg.max_vms);
     try testing.expectEqual(@as(u16, 9090), cfg.app_port);
+    try testing.expect(cfg.guest_service_prestarted);
     // Untouched keys keep defaults.
     try testing.expectEqual(@as(u16, 1), cfg.cpus);
 }
@@ -167,6 +179,12 @@ test "parseText errors on a malformed integer" {
     var cfg = init(testing.allocator);
     defer cfg.deinit();
     try testing.expectError(error.InvalidCharacter, cfg.parseText("cpus = not-a-number\n"));
+}
+
+test "parseText errors on a malformed boolean" {
+    var cfg = init(testing.allocator);
+    defer cfg.deinit();
+    try testing.expectError(error.InvalidBoolean, cfg.parseText("guest_service_prestarted = yes\n"));
 }
 
 test "validateSunPath accepts short paths and rejects over-long ones" {
