@@ -7,6 +7,12 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "LICENSE",
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs",
+        "scripts",
+        "nether-supervisor.conf",
     },
     .dependencies = .{},
 }

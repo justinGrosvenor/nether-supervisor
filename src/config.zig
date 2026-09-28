@@ -1,5 +1,5 @@
 //! The supervisor's own configuration: a `key = value` file (same format nether
-//! uses for `nether.conf`) with `NSUP_*` environment-variable overrides. Loaded
+//! uses for `nether.conf`). Loaded
 //! once at startup and owned for the process lifetime (an arena backs the duped
 //! strings). See the plan for the full key list.
 

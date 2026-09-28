@@ -1,24 +1,58 @@
 # nether-supervisor
 
 **A pool of Linux microVMs behind one tenant API.** The supervisor is a Zig daemon
-that launches Nether VMs for Swerver, prepares warm snapshot bases, and returns
-the data socket for each tenant's service.
+that launches [Nether](https://github.com/justinGrosvenor/nether) VMs, prepares
+warm snapshot bases, and returns the data socket for each tenant's service.
 
 Concurrent requests for the same tenant share a single boot. Subsequent requests
 reuse the ready VM. With a warm base, new tenants start from a snapshot of an
 already running application.
 
 ```text
-Swerver -- ensure <tenant> --> supervisor -- launch/restore --> Nether VM
-        <-- VM data socket --
-Swerver --------------------- HTTP over data socket -------> guest service
+Your app -- ensure <tenant> --> supervisor -- launch/restore --> Nether VM
+         <-- VM data socket --
+Your app --------------------- HTTP over data socket -------> guest service
 ```
 
 Nether tracks connection activity and handles idle shutdown. At capacity, the
 supervisor returns `pool full`, preserving VMs that are serving requests. Exited
 VMs release their slots for new tenants.
 
-## Build and run
+## Try the warm-fork demo
+
+The demo prepares a running HTTP server, forks it into `alpha` and `beta`, and
+checks that both inherited the same server with independent request counters.
+Requesting `alpha` again reuses its VM and state.
+
+With Zig **0.16.0**, Python **3.9+**, and a built Nether checkout with a runtime
+guest image:
+
+```sh
+zig build -Doptimize=ReleaseSafe
+python3 scripts/demo.py --nether-dir ../nether
+```
+
+For a fresh machine, follow the [setup guide](docs/quickstart.md), which includes
+guest image preparation for Apple Silicon and Linux/x86-64. The demo uses a
+private temporary directory, stops its own processes on exit, and retains its
+run files. Add `--hold` to leave it running and get `curl` commands to try yourself.
+
+The demo runs directly against the supervisor; it needs no gateway, console,
+account, or hosted service.
+
+## Use it from your application
+
+Send `ensure <tenant>\n` to the supervisor's Unix control socket. A successful
+reply contains the VM's Unix data-socket path, followed by byte `0x1e` and `0\n`.
+Send HTTP over that data socket to reach the guest's service. Read the complete
+reply trailer and check its exit code before using the returned path.
+
+The demo's Python client is in [scripts/live.py](scripts/live.py). Applications can
+connect directly, or use [Swerver](https://github.com/justinGrosvenor/swerver)
+to route tenant traffic. See the [protocol](docs/operations.md#protocol-and-access)
+for framing and the [operations guide](docs/operations.md) for configuration.
+
+## Build and configure
 
 Requires **Zig 0.16.0**, a Nether binary built for your host, and matching guest
 artifacts. Use the current Nether and supervisor sources together for
@@ -29,7 +63,7 @@ zig build
 zig build test
 ```
 
-Edit [nether-supervisor.conf](nether-supervisor.conf) in this checkout. Set
+For your own deployment, edit [nether-supervisor.conf](nether-supervisor.conf). Set
 `nether_bin` to the absolute path of the Nether executable and `kernels_dir` to
 your guest artifact directory:
 
@@ -47,8 +81,9 @@ at the service started by guest init.
 ./zig-out/bin/nether-supervisor
 ```
 
-The daemon reads its config from the working directory. Configure Swerver to use
-the supervisor's `control_socket` and the same `socket_dir` for tenant routes.
+The daemon reads its config from the working directory. If you use Swerver,
+configure its tenant routes with the supervisor's `control_socket` and the same
+`socket_dir`.
 
 ## Warm bases and VM lifecycle
 
@@ -68,13 +103,20 @@ readiness behavior, protocol, and lifecycle details.
 ## Observe and test
 
 Enable `status_addr` for aggregate JSON at `/status` and Prometheus metrics at
-`/metrics`. The Swerver console connects through its `RemoteSupervisor` adapter
-and attaches to individual Nether control sockets for VM inspection.
+`/metrics`. Inspect individual VMs through their Nether control sockets.
 
-[gate_idle.py](scripts/gate_idle.py) exercises capacity pressure, a slow response
-across the idle timeout, cached traffic, and eventual idle reclamation. Run it
-with the commands in [operations](docs/operations.md#checks).
+The [live checks](docs/operations.md#checks) cover warm forks, cold serving,
+concurrent requests, crash recovery, status endpoints, and connection-aware idle
+reclamation. CI builds and runs unit tests on macOS and Linux.
 
 The pool state machine lives in [`src/pool.zig`](src/pool.zig); process launch and
 readiness live in [`src/supervisor.zig`](src/supervisor.zig) and
 [`src/boot.zig`](src/boot.zig).
+
+## Contribute
+
+Tell us what you're building and where you get stuck. Reports about setup,
+workload behavior, and integrations help decide what to build next. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for reproducing issues and submitting changes.
+
+[Apache-2.0](LICENSE).

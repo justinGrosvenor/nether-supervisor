@@ -1,10 +1,10 @@
-//! nether-supervisor: the 1c VM supervisor for the two-tier microVM platform.
+//! nether-supervisor: a tenant VM pool for Nether.
 //!
 //! North side: a Unix control socket swerver's `wasm_control_socket` dials;
 //! answers `ensure <tenant>` with the tenant's warm VM `data_socket` path.
 //! South side: owns a pool of real `nether` processes (spawn/fork, drive,
-//! reclaim). See docs/ and the plan. Phase 0 is the scaffold: load config,
-//! validate, and report; the reactor lands in later phases.
+//! reclaim). Loads configuration and starts the supervisor's control listener,
+//! per-connection workers, housekeeping, and optional status endpoints.
 
 const std = @import("std");
 const config = @import("config.zig");

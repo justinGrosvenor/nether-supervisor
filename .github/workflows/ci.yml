@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.optimize }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon src
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }}
+      - name: Unit tests
+        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+      - name: Check demo and live-check syntax
+        run: |
+          python3 -m py_compile scripts/*.py
+          for script in scripts/*.sh; do bash -n "$script"; done
+      # Live checks run on a host with HVF/KVM and prepared Nether guest images.

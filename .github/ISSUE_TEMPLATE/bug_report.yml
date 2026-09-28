@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a setup problem or unexpected supervisor behavior.
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What are you trying to do?
+      description: Describe your workload and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: Include the command, relevant configuration, and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Host OS/architecture, Zig version, supervisor and Nether commits, and any local changes.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: The demo prints its run directory. Include supervisor.log and the affected VM's nether.log excerpts.
+      render: text

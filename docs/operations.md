@@ -100,18 +100,49 @@ restart does not adopt existing VMs or recover IDs.
 
 ```sh
 zig build test
-python3 scripts/gate_idle.py --supervisor /absolute/path/nether-supervisor \
-  --nether /absolute/path/nether --kernels /absolute/path/kernels
+zig build test -Doptimize=ReleaseSafe
+python3 scripts/demo.py --nether-dir ../nether
+python3 scripts/gate.py cold --nether-dir ../nether
+python3 scripts/gate.py concurrent --nether-dir ../nether
+python3 scripts/gate.py reaper --nether-dir ../nether
+python3 scripts/gate.py status --nether-dir ../nether
+python3 scripts/gate_idle.py --nether-dir ../nether
 ```
 
-The live gate uses a private temporary directory and retains logs. It checks an
-8-second response across a 5-second idle limit, capacity rejection, cached
-traffic, and eventual idle reclamation.
+Prepare Nether and the runtime guest image using the [quickstart](quickstart.md).
+Every live runner accepts `--supervisor`, `--nether`, and `--kernels` to override
+the default checkout locations. Each uses a private temporary directory and
+process group, retains its run files, and only stops processes it launched.
+Failures return a nonzero exit status and print the supervisor log tail.
 
-The 2026-09-06 runs passed 48 tests on macOS and under Docker linux/amd64, native
-and Linux ReleaseSafe builds, and the live idle gate on HVF. Live KVM serving
-remains the outstanding backend check.
+| Check | Behavior exercised |
+| --- | --- |
+| `demo.py` | Warm base bake, independent counters in sibling forks, repeat-tenant reuse |
+| `gate.py cold` | Cold guest boot, HTTP response, repeat-tenant reuse |
+| `gate.py concurrent` | Same-tenant boot deduplication and overlapping distinct-tenant bring-up |
+| `gate.py reaper` | Crash eviction, replacement VM, supervisor/VM shutdown |
+| `gate.py status` | Status and metrics authentication and live pool values |
+| `gate_idle.py` | An 8-second response across a 5-second idle limit, capacity rejection, cached traffic, and eventual reclamation |
 
-The older shell gates use fixed paths, stop matching processes, and delete
-`/tmp/nsup`. Run them in an isolated environment with no stack using those
-resources.
+The `gate*.sh` files are compatibility entry points for these Python runners
+and accept the same path options.
+
+### Recorded verification
+
+The 2026-09-28 release preparation passed all six live checks above on Apple
+Silicon with the current Nether and supervisor working trees. A held demo kept
+serving while a separate cold gate ran and cleaned up; Ctrl-C then stopped the
+held demo's processes.
+
+Both Debug and ReleaseSafe unit suites passed 48 tests on macOS and as
+cross-compiled Linux/x86-64 binaries under Docker emulation. Native macOS and
+Linux/x86-64 ReleaseSafe builds passed. These are local checks; the new CI
+workflow has not run on GitHub yet. Live KVM serving is a separate backend check.
+
+Fresh guest preparation found the old Alpine kernel pin had been removed from
+the mirror. Nether's replacement pins are Linux `6.12.111-r0` and Alpine
+minirootfs `3.21.8`; the rootfs checksum matches Alpine's published checksum and
+the kernel APK signature verifies against Alpine's keys. A runtime image built
+from those artifacts passed the warm-fork demo and idle/capacity gate on HVF.
+Publish the matching Nether image-script and idle-handling changes with this
+supervisor revision so a fresh checkout follows the same tested path.
