@@ -43,8 +43,9 @@ pub const RealLauncher = struct {
     cpus: u16,
     ram_mb: u32,
     idle_timeout_s: u32,
+    idle_ttl_ms: u64 = 60_000,
 
-    pub const Error = error{ MkdirFailed, WriteFailed, ForkFailed, PathTooLong };
+    pub const Error = error{ MkdirFailed, WriteFailed, ForkFailed, PathTooLong, MissingArtifact, InvalidArtifact, SymlinkFailed };
 
     /// Spawn a cold-boot nether process. Returns the child pid. The VM's control
     /// and data sockets (absolute, under the caller's socket_dir) are written
@@ -59,6 +60,39 @@ pub const RealLauncher = struct {
     /// is the warm path (~76ms to first byte vs a multi-second cold boot).
     pub fn spawnFork(self: *const RealLauncher, id: u32, control_socket: []const u8, data_socket: []const u8, base_snap: []const u8) Error!std.c.pid_t {
         return self.spawn(id, control_socket, data_socket, base_snap);
+    }
+
+    fn prepareArtifacts(self: *const RealLauncher, cwd: []const u8, target_os: std.Target.Os.Tag) Error!void {
+        var source_z_buf: [512]u8 = undefined;
+        const source_z = std.fmt.bufPrintZ(&source_z_buf, "{s}", .{self.kernels_dir}) catch return error.PathTooLong;
+        // Symlink targets must survive the child's chdir, including when the
+        // operator supplied a relative kernels_dir.
+        var resolved: [std.fs.max_path_bytes]u8 = undefined;
+        const source = std.mem.span(std.c.realpath(source_z, &resolved) orelse {
+            log.err("guest artifacts directory unavailable: {s}", .{self.kernels_dir});
+            return error.MissingArtifact;
+        });
+        const required: []const []const u8 = if (target_os == .linux)
+            &.{ "vmlinux", "initramfs" }
+        else
+            &.{ "Image", "initramfs.cpio.gz" };
+        for (required) |name| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ source, name }) catch return error.PathTooLong;
+            try requireArtifact(path);
+        }
+        const links = [_]struct { name: []const u8, suffix: []const u8 }{
+            .{ .name = "kernels", .suffix = "" },
+            .{ .name = "vmlinux", .suffix = "/vmlinux" },
+            .{ .name = "initramfs", .suffix = "/initramfs" },
+        };
+        for (links) |link| {
+            var link_buf: [600]u8 = undefined;
+            var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const link_z = std.fmt.bufPrintZ(&link_buf, "{s}/{s}", .{ cwd, link.name }) catch return error.PathTooLong;
+            const target_z = std.fmt.bufPrintZ(&target_buf, "{s}{s}", .{ source, link.suffix }) catch return error.PathTooLong;
+            os.symlinkForceZ(target_z, link_z) catch return error.SymlinkFailed;
+        }
     }
 
     /// Shared spawn: build the per-VM cwd + nether.conf and fork/exec nether.
@@ -81,16 +115,9 @@ pub const RealLauncher = struct {
         os.mkdirZ(root_z);
         os.mkdirZ(cwd);
 
-        // Symlink kernels/ into the cwd (nether reads kernels/ from cwd on a cold
-        // boot). A fork restores from the snapshot and never reads kernels, so
-        // skip the symlink there.
-        if (!is_fork) {
-            var link_buf: [600]u8 = undefined;
-            const link_z = std.fmt.bufPrintZ(&link_buf, "{s}/kernels", .{cwd}) catch return error.PathTooLong;
-            var target_buf: [512]u8 = undefined;
-            const target_z = std.fmt.bufPrintZ(&target_buf, "{s}", .{self.kernels_dir}) catch return error.PathTooLong;
-            os.symlinkForceZ(target_z, link_z);
-        }
+        // A restore reads the snapshot; a cold boot must have readable guest
+        // artifacts before fork, so missing vmlinux cannot select a smoke guest.
+        if (!is_fork) try self.prepareArtifacts(cwd, @import("builtin").os.tag);
 
         // Write the nether.conf into the cwd (fork adds restore=1 + restore_from).
         var conf_buf: [1024]u8 = undefined;
@@ -103,6 +130,7 @@ pub const RealLauncher = struct {
             .cpus = self.cpus,
             .ram_mb = self.ram_mb,
             .idle_timeout_s = self.idle_timeout_s,
+            .idle_timeout_ms = vm.effectiveIdleMs(self.idle_ttl_ms, self.idle_timeout_s),
         }) catch return error.WriteFailed;
         var conf_path_buf: [600]u8 = undefined;
         const conf_path = std.fmt.bufPrint(&conf_path_buf, "{s}/nether.conf", .{cwd}) catch return error.PathTooLong;
@@ -132,7 +160,65 @@ pub const RealLauncher = struct {
     }
 };
 
+fn requireArtifact(path: [:0]const u8) RealLauncher.Error!void {
+    // NONBLOCK avoids hanging on a mistakenly configured FIFO; fstat excludes
+    // directories/devices as well as empty files before the VM is spawned.
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .NONBLOCK = true }, 0) catch {
+        log.err("guest artifact unreadable: {s}", .{path});
+        return error.MissingArtifact;
+    };
+    defer os.closeFd(fd);
+    const valid = if (@import("builtin").os.tag == .linux) blk: {
+        const linux = std.os.linux;
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .SIZE = true }, &st)) != .SUCCESS) break :blk false;
+        break :blk st.mask.TYPE and st.mask.SIZE and (st.mode & std.posix.S.IFMT) == std.posix.S.IFREG and st.size > 0;
+    } else blk: {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) break :blk false;
+        break :blk (st.mode & std.posix.S.IFMT) == std.posix.S.IFREG and st.size > 0;
+    };
+    if (!valid) {
+        log.err("guest artifact must be a nonempty regular file: {s}", .{path});
+        return error.InvalidArtifact;
+    }
+}
+
 pub const BringUpError = error{ Connect, Handshake, AgentTimeout, ServerStart, NotServing };
+
+test "cold artifact setup validates the backend and installs readable links" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const io = std.testing.io;
+    try temp.dir.createDir(io, "guest", .default_dir);
+    try temp.dir.createDir(io, "vm", .default_dir);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try temp.dir.realPath(io, &root_buf)];
+    var guest_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var vm_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const guest = try std.fmt.bufPrint(&guest_buf, "{s}/guest", .{root});
+    const cwd = try std.fmt.bufPrint(&vm_buf, "{s}/vm", .{root});
+    const launcher = RealLauncher{ .nether_bin = "/unused", .kernels_dir = guest, .work_root = cwd, .app_port = 8080, .cpus = 1, .ram_mb = 512, .idle_timeout_s = 90 };
+    try std.testing.expectError(error.MissingArtifact, launcher.prepareArtifacts(cwd, .linux));
+    try temp.dir.writeFile(io, .{ .sub_path = "guest/vmlinux", .data = "kernel fixture" });
+    try temp.dir.writeFile(io, .{ .sub_path = "guest/initramfs", .data = "" });
+    try std.testing.expectError(error.InvalidArtifact, launcher.prepareArtifacts(cwd, .linux));
+    try temp.dir.writeFile(io, .{ .sub_path = "guest/initramfs", .data = "initramfs fixture" });
+    try launcher.prepareArtifacts(cwd, .linux);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/initramfs", .{cwd});
+    try requireArtifact(path); // follows the link exactly as the child does
+    try std.testing.expectError(error.MissingArtifact, launcher.prepareArtifacts(cwd, .macos));
+    try temp.dir.writeFile(io, .{ .sub_path = "guest/Image", .data = "arm kernel fixture" });
+    try temp.dir.writeFile(io, .{ .sub_path = "guest/initramfs.cpio.gz", .data = "arm initramfs fixture" });
+    try launcher.prepareArtifacts(cwd, .macos);
+    const arm_path = try std.fmt.bufPrintZ(&path_buf, "{s}/kernels/Image", .{cwd});
+    try requireArtifact(arm_path);
+    // A directory occupying the link name must surface a setup failure.
+    try temp.dir.deleteFile(io, "vm/vmlinux");
+    try temp.dir.createDir(io, "vm/vmlinux", .default_dir);
+    try std.testing.expectError(error.SymlinkFailed, launcher.prepareArtifacts(cwd, .linux));
+}
 
 pub const ServiceActions = struct {
     wait_for_agent: bool,

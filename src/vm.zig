@@ -19,7 +19,15 @@ pub const Spec = struct {
     cpus: u16,
     ram_mb: u32,
     idle_timeout_s: u32,
+    idle_timeout_ms: ?u64 = null,
 };
+
+/// Nether observes the connections. Enforce the smaller enabled idle limit
+/// there; the supervisor must not infer idleness from ensure timestamps.
+pub fn effectiveIdleMs(ttl_ms: u64, timeout_s: u32) u64 {
+    const timeout_ms = @as(u64, timeout_s) * 1000;
+    return if (ttl_ms == 0) timeout_ms else if (timeout_ms == 0) ttl_ms else @min(ttl_ms, timeout_ms);
+}
 
 /// Write the VM's `nether.conf` body into `out`. Cold-boot and fork differ only
 /// by the `restore=1` + `restore_from=<base>` lines. Returns the written slice.
@@ -31,8 +39,11 @@ pub fn bootConfText(out: []u8, spec: Spec) error{NoSpace}![]u8 {
     n += (std.fmt.bufPrint(out[n..], "app_port = {d}\n", .{spec.app_port}) catch return error.NoSpace).len;
     n += (std.fmt.bufPrint(out[n..], "cpus = {d}\n", .{spec.cpus}) catch return error.NoSpace).len;
     n += (std.fmt.bufPrint(out[n..], "ram_mb = {d}\n", .{spec.ram_mb}) catch return error.NoSpace).len;
-    // nether self-reclaims an idle VM as a safety net under the supervisor TTL.
+    // Keep seconds for compatibility; updated Nether uses the millisecond override.
     n += (std.fmt.bufPrint(out[n..], "idle_timeout_s = {d}\n", .{spec.idle_timeout_s}) catch return error.NoSpace).len;
+    if (spec.idle_timeout_ms) |ms| {
+        n += (std.fmt.bufPrint(out[n..], "idle_timeout_ms = {d}\n", .{ms}) catch return error.NoSpace).len;
+    }
     if (spec.restore_from.len > 0) {
         n += (std.fmt.bufPrint(out[n..], "restore = 1\n", .{}) catch return error.NoSpace).len;
         n += (std.fmt.bufPrint(out[n..], "restore_from = {s}\n", .{spec.restore_from}) catch return error.NoSpace).len;
@@ -58,6 +69,14 @@ pub fn socketPaths(
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "idle policy uses the smaller enabled limit without rounding" {
+    try testing.expectEqual(@as(u64, 1501), effectiveIdleMs(1501, 90));
+    try testing.expectEqual(@as(u64, 1000), effectiveIdleMs(60_000, 1));
+    try testing.expectEqual(@as(u64, 90_000), effectiveIdleMs(0, 90));
+    try testing.expectEqual(@as(u64, 1501), effectiveIdleMs(1501, 0));
+    try testing.expectEqual(@as(u64, 0), effectiveIdleMs(0, 0));
+}
 
 test "bootConfText: cold-boot omits restore lines" {
     var buf: [512]u8 = undefined;

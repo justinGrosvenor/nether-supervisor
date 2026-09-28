@@ -5,7 +5,7 @@
 //! first caller becomes the bring-up owner (drives the VM to serving off-lock);
 //! the rest poll the pool until the owner marks it ready. A spinlock guards the
 //! pool + the owner claim (held only for the microsecond state transitions; the
-//! slow I/O runs outside it). A housekeeping thread ticks idle-reclaim/deadline.
+//! slow I/O runs outside it). A housekeeping thread reaps exited VMs and expires waiters.
 
 const std = @import("std");
 const c = std.c;
@@ -77,6 +77,7 @@ pub const Supervisor = struct {
                 .cpus = cfg.cpus,
                 .ram_mb = cfg.ram_mb,
                 .idle_timeout_s = cfg.idle_timeout_s,
+                .idle_ttl_ms = cfg.idle_ttl_ms,
             },
         };
     }
@@ -91,7 +92,6 @@ pub const Supervisor = struct {
             .cpus = self.cfg.cpus,
             .ram_mb = self.cfg.ram_mb,
             .idle_timeout_s = self.cfg.idle_timeout_s,
-            .idle_ttl_ms = self.cfg.idle_ttl_ms,
             .max_vms = self.cfg.max_vms,
         }, self.launcher());
     }
@@ -338,7 +338,7 @@ pub const Supervisor = struct {
     /// so each bake starts pristine. spawnCold recreates the dir and its
     /// contents; a leftover base.snap in particular must not survive.
     fn cleanBaseDir(work_root: []const u8) void {
-        for ([_][]const u8{ "base.snap", "nether.conf", "nether.log", "kernels" }) |name| {
+        for ([_][]const u8{ "base.snap", "nether.conf", "nether.log", "kernels", "vmlinux", "initramfs" }) |name| {
             var buf: [600]u8 = undefined;
             const path = std.fmt.bufPrint(&buf, "{s}/{x:0>8}/{s}", .{ work_root, BASE_ID, name }) catch continue;
             os.unlinkPath(path);
@@ -401,7 +401,7 @@ pub const Supervisor = struct {
         self.listen_fd = try os.listenUnix(self.cfg.control_socket);
         log.info("north control socket listening at {s}", .{self.cfg.control_socket});
 
-        // Housekeeping thread: reap + idle-reclaim + waiter-deadline sweep.
+        // Housekeeping thread: reap exited VMs + waiter-deadline sweep.
         if (std.Thread.spawn(.{}, housekeep, .{self})) |t| t.detach() else |e| {
             log.warn("housekeeping thread not started: {s}", .{@errorName(e)});
         }
@@ -427,8 +427,9 @@ pub const Supervisor = struct {
         os.closeFd(conn);
     }
 
-    /// Periodic pool maintenance: reap dead children (crash-eviction), idle-
-    /// reclaim ready VMs, and deadline-sweep booting waiters. Also the shutdown
+    /// Periodic pool maintenance: reap dead children and expire booting waiters.
+    /// Nether handles idle expiry using actual connection lifetimes; a process
+    /// exit releases its pool slot. Also the shutdown
     /// watcher: on SIGTERM/SIGINT it drains every VM's bill and exits. Deadline
     /// answers are dropped here (waiters handle their own deadline inline in
     /// waitForOwner); the VM is kept warm regardless.
@@ -448,10 +449,9 @@ pub const Supervisor = struct {
         }
     }
 
-    /// Reap dead child processes (WNOHANG). A VM that dies while still mapped is
-    /// an unexpected crash: evict its tenant so the next ensure re-boots. A VM we
-    /// killed intentionally (idle-reclaim / onFailed) is already inactive - we
-    /// just clear the zombie. MUST be called under self.lock.
+    /// Reap dead children (WNOHANG). Normal shutdowns, including idle expiry,
+    /// count as reclaims; failures count as evictions. A VM killed by onFailed
+    /// is already inactive. MUST be called under self.lock.
     fn reapDead(self: *Supervisor, answers: []pool_mod.Answer) void {
         while (true) {
             const w = os.reapAnyNoHang();
@@ -459,8 +459,13 @@ pub const Supervisor = struct {
             for (&self.vms) |*v| {
                 if (v.pid == w.pid and v.pid != 0) {
                     if (v.active) {
-                        log.warn("vm={x} exited unexpectedly (code={d}); evicting", .{ v.vm_id, w.exit_code });
-                        _ = self.pool.onExited(v.vm_id, answers);
+                        if (w.exit_code == 0) {
+                            log.info("vm={x} stopped; reclaiming mapping", .{v.vm_id});
+                            _ = self.pool.onStopped(v.vm_id, answers);
+                        } else {
+                            log.warn("vm={x} exited unexpectedly (code={d}); evicting", .{ v.vm_id, w.exit_code });
+                            _ = self.pool.onExited(v.vm_id, answers);
+                        }
                     }
                     v.* = .{}; // tracking slot free; pid reaped
                     break;

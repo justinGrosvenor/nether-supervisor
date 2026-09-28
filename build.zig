@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = optimize != .Debug,
         }),
     });
     // Link libc: on macOS syscalls must route through libc (no stable syscall

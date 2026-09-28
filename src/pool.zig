@@ -1,7 +1,7 @@
 //! The VM pool: the `ensure` state machine. Maps a tenant to its VM, boots one
 //! on a cold-start MISS (deduped so N concurrent ensures share one boot), keeps
-//! a booting VM warm past a caller's deadline so the retry HITs, reclaims idle
-//! VMs, and evicts on crash.
+//! a booting VM warm past a caller's deadline so the retry HITs, and removes VMs
+//! when their processes exit. Nether owns connection-aware idle expiry.
 //!
 //! DESIGN: this is a pure, event-driven state machine. Readiness, failure, and
 //! crash are injected as events (onReady/onFailed/onExited) rather than owned by
@@ -13,7 +13,9 @@
 const std = @import("std");
 const launcher_mod = @import("launcher.zig");
 
-pub const CAP: usize = 64; // max VM slots; config max_vms is clamped to this
+// Bounded storage. At max_vms, admission fails without evicting serving VMs;
+// connection-aware idle reclamation belongs to Nether, which sees the data plane.
+pub const CAP: usize = 128; // max VM slots; config max_vms is clamped to this
 pub const MAX_WAITERS: usize = 16; // ~ swerver workers firing one ensure each
 pub const TENANT_MAX: usize = 128;
 pub const PATH_MAX: usize = 104; // sun_path
@@ -32,7 +34,6 @@ const Slot = struct {
     data_buf: [PATH_MAX]u8 = undefined,
     data_len: u16 = 0,
     booting_since_ms: u64 = 0,
-    last_used_ms: u64 = 0,
     waiters: [MAX_WAITERS]Waiter = undefined,
     waiter_count: u8 = 0,
 
@@ -67,7 +68,6 @@ pub const Config = struct {
     cpus: u16 = 1,
     ram_mb: u32 = 512, // >= 384 floor (256 panics on rootfs mount); see config.zig
     idle_timeout_s: u32 = 90,
-    idle_ttl_ms: u64 = 60_000,
     max_vms: u32 = 16,
 };
 
@@ -176,25 +176,6 @@ pub const Pool = struct {
         return null;
     }
 
-    /// Reclaim the least-recently-used READY slot to make room. Returns it (now
-    /// free) or null if every slot is booting (cannot reclaim a boot in flight).
-    fn reclaimLruReady(self: *Pool) ?*Slot {
-        var victim: ?*Slot = null;
-        for (&self.slots) |*s| {
-            if (s.state == .ready) {
-                if (victim == null or s.last_used_ms < victim.?.last_used_ms) victim = s;
-            }
-        }
-        if (victim) |s| {
-            self.launcher.kill(s.vm_id);
-            self.reclaims += 1;
-            s.state = .free;
-            s.waiter_count = 0;
-            return s;
-        }
-        return null;
-    }
-
     /// Cold-start / warm-hit entry. See EnsureOutcome. On MISS this spawns a VM
     /// via the launcher and parks `waiter_id`; the answer arrives on the next
     /// onReady/onFailed/tick. `deadline_ms` is the caller's (swerver's) budget.
@@ -205,7 +186,6 @@ pub const Pool = struct {
         if (self.findByTenant(name)) |s| {
             switch (s.state) {
                 .ready => {
-                    s.last_used_ms = now_ms;
                     self.hits += 1;
                     return .{ .hit = s.dataSocket() };
                 },
@@ -219,19 +199,10 @@ pub const Pool = struct {
 
         // MISS.
         self.misses += 1;
-        var slot = self.freeSlot() orelse blk: {
-            if (self.activeCount() >= self.cfg.max_vms) {
-                break :blk self.reclaimLruReady() orelse return .{ .rejected = "pool full" };
-            }
-            // Under the cap but no free slot only happens when CAP < max_vms,
-            // which init() prevents; treat defensively as full.
-            break :blk self.reclaimLruReady() orelse return .{ .rejected = "pool full" };
-        };
-        if (self.activeCount() >= self.cfg.max_vms) {
-            // Reclaim to stay within max_vms even if a raw slot was free.
-            _ = self.reclaimLruReady() orelse return .{ .rejected = "pool full" };
-            slot = self.freeSlot() orelse return .{ .rejected = "pool full" };
-        }
+        // A ready VM can still own an active response (or the first request
+        // about to connect after ensure). Capacity pressure never kills it.
+        if (self.activeCount() >= self.cfg.max_vms) return .{ .rejected = "pool full" };
+        const slot = self.freeSlot() orelse return .{ .rejected = "pool full" };
 
         const vm_id = self.next_vm_id;
         self.next_vm_id +%= 1;
@@ -264,7 +235,6 @@ pub const Pool = struct {
         @memcpy(slot.tenant_buf[0..name.len], name);
         slot.tenant_len = @intCast(name.len);
         slot.booting_since_ms = now_ms;
-        slot.last_used_ms = now_ms;
         slot.waiter_count = 0;
         _ = addWaiter(slot, waiter_id, deadline_ms);
         return .parked;
@@ -278,7 +248,7 @@ pub const Pool = struct {
         // The launcher may report the true data_socket; keep ours (they match).
         _ = data_socket;
         s.state = .ready;
-        s.last_used_ms = now_ms;
+        _ = now_ms;
         const n = drainWaiters(s, .{ .ok = s.dataSocket() }, answers);
         return n;
     }
@@ -298,8 +268,17 @@ pub const Pool = struct {
     /// A VM process exited unexpectedly (reaper saw it die). Evict its mapping so
     /// the next ensure re-cold-starts; fail any waiters (a ready VM has none).
     pub fn onExited(self: *Pool, vm_id: u32, answers: []Answer) usize {
+        return self.removeExited(vm_id, false, answers);
+    }
+
+    /// Normal VM shutdown, including Nether's connection-aware idle expiry.
+    pub fn onStopped(self: *Pool, vm_id: u32, answers: []Answer) usize {
+        return self.removeExited(vm_id, true, answers);
+    }
+
+    fn removeExited(self: *Pool, vm_id: u32, normal: bool, answers: []Answer) usize {
         const s = self.findByVmId(vm_id) orelse return 0;
-        self.evictions += 1;
+        if (normal) self.reclaims += 1 else self.evictions += 1;
         const n = drainWaiters(s, .{ .fail = "vm exited" }, answers);
         s.state = .free;
         s.waiter_count = 0;
@@ -307,9 +286,9 @@ pub const Pool = struct {
     }
 
     /// Housekeeping. (1) Deadline expiry: fail+drop waiters past their deadline
-    /// but KEEP the VM booting (it stays warm, so the caller's retry HITs). (2)
-    /// Idle reclaim: shut down a ready VM unused for idle_ttl_ms. Returns the
-    /// number of answers written.
+    /// but KEEP the VM booting (it stays warm, so the caller's retry HITs).
+    /// Nether owns idle expiry because cached data-plane traffic bypasses ensure.
+    /// Its exit event frees the mapping. Returns the number of answers written.
     pub fn tick(self: *Pool, now_ms: u64, answers: []Answer) usize {
         var n: usize = 0;
         for (&self.slots) |*s| {
@@ -331,14 +310,6 @@ pub const Pool = struct {
                         }
                     }
                     s.waiter_count = kept;
-                },
-                .ready => {
-                    if (now_ms -% s.last_used_ms >= self.cfg.idle_ttl_ms) {
-                        self.launcher.kill(s.vm_id);
-                        self.reclaims += 1;
-                        s.state = .free;
-                        s.waiter_count = 0;
-                    }
                 },
                 else => {},
             }
@@ -370,7 +341,7 @@ fn drainWaiters(s: *Slot, result: Answer.Result, answers: []Answer) usize {
 const testing = std.testing;
 
 fn testPool(mock: *launcher_mod.MockLauncher) Pool {
-    return Pool.init(.{ .socket_dir = "/tmp/nsup", .idle_ttl_ms = 1000, .max_vms = 4 }, mock.launcher());
+    return Pool.init(.{ .socket_dir = "/tmp/nsup", .max_vms = 4 }, mock.launcher());
 }
 
 test "cold MISS spawns one VM; onReady answers the waiter; second ensure HITs" {
@@ -433,20 +404,21 @@ test "deadline expiry fails the waiter but keeps the VM warm; retry HITs" {
     try testing.expectEqual(@as(u32, 1), mock.spawns);
 }
 
-test "idle reclaim shuts down a ready VM and evicts the mapping" {
+test "housekeeping cannot reclaim a ready VM while data bypasses ensure" {
     var mock = launcher_mod.MockLauncher{};
-    var pool = testPool(&mock); // idle_ttl_ms = 1000
+    var pool = testPool(&mock);
     _ = pool.ensure("alpha", 1, 100, 5100);
     var ans: [MAX_WAITERS]Answer = undefined;
-    _ = pool.onReady(mock.last_spawned_id, "/d", 200, &ans);
+    const vm_id = mock.last_spawned_id;
+    _ = pool.onReady(vm_id, "/d", 200, &ans);
+    _ = pool.tick(1_000_000, &ans);
     try testing.expectEqual(@as(u32, 1), pool.warmCount());
-
-    // Idle past the TTL -> reclaimed + killed.
-    _ = pool.tick(200 + 1000, &ans);
-    try testing.expectEqual(@as(u32, 0), pool.warmCount());
-    try testing.expectEqual(@as(u32, 1), mock.kills);
-    // Next ensure re-cold-starts (a fresh spawn).
-    try testing.expect(pool.ensure("alpha", 2, 3000, 8000) == .parked);
+    try testing.expectEqual(@as(u32, 0), mock.kills);
+    // The VM reports its own exit after its connections and idle period finish.
+    _ = pool.onStopped(vm_id, &ans);
+    try testing.expectEqual(@as(u64, 1), pool.reclaims);
+    try testing.expectEqual(@as(u64, 0), pool.evictions);
+    try testing.expect(pool.ensure("alpha", 2, 1_000_001, 1_005_001) == .parked);
     try testing.expectEqual(@as(u32, 2), mock.spawns);
 }
 
@@ -488,9 +460,9 @@ test "boot failure is reported and the slot freed" {
     try testing.expectEqual(@as(u32, 0), pool.bootingCount());
 }
 
-test "pool full: distinct tenants past max_vms reclaim the LRU ready VM" {
+test "pool full preserves serving VMs until a process actually exits" {
     var mock = launcher_mod.MockLauncher{};
-    var pool = Pool.init(.{ .socket_dir = "/tmp/nsup", .idle_ttl_ms = 100000, .max_vms = 2 }, mock.launcher());
+    var pool = Pool.init(.{ .socket_dir = "/tmp/nsup", .max_vms = 2 }, mock.launcher());
     var ans: [MAX_WAITERS]Answer = undefined;
 
     // Two warm VMs at capacity.
@@ -500,11 +472,15 @@ test "pool full: distinct tenants past max_vms reclaim the LRU ready VM" {
     _ = pool.onReady(mock.last_spawned_id, "/d", 21, &ans);
     try testing.expectEqual(@as(u32, 2), pool.warmCount());
 
-    // A third tenant at capacity reclaims the LRU (tenant a, used at 10).
+    const first_id = pool.findByTenant("a").?.vm_id;
     const o = pool.ensure("c", 3, 100, 5100);
-    try testing.expect(o == .parked);
-    try testing.expectEqual(@as(u32, 1), mock.kills); // one reclaimed
+    try testing.expect(o == .rejected);
+    try testing.expectEqualStrings("pool full", o.rejected);
+    try testing.expectEqual(@as(u32, 0), mock.kills);
+    try testing.expectEqual(@as(u32, 2), mock.spawns);
+    try testing.expect(pool.ensure("a", 4, 200, 5200) == .hit);
+    try testing.expect(pool.ensure("b", 5, 200, 5200) == .hit);
+    _ = pool.onExited(first_id, &ans);
+    try testing.expect(pool.ensure("c", 6, 300, 5300) == .parked);
     try testing.expectEqual(@as(u32, 3), mock.spawns);
-    // Tenant a is gone; re-ensuring it re-cold-starts.
-    try testing.expect(pool.ensure("a", 4, 200, 5200) == .parked or pool.findByTenant("a") != null);
 }

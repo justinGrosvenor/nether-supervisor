@@ -56,9 +56,9 @@ pub fn mkdirZ(path: [*:0]const u8) void {
 }
 
 /// Force-create a symlink (unlink any existing link first). NUL-terminated.
-pub fn symlinkForceZ(target: [*:0]const u8, link: [*:0]const u8) void {
+pub fn symlinkForceZ(target: [*:0]const u8, link: [*:0]const u8) error{SymlinkFailed}!void {
     _ = std.c.unlink(link);
-    _ = std.c.symlink(target, link);
+    if (std.c.symlink(target, link) != 0) return error.SymlinkFailed;
 }
 
 /// Unlink a path given as a slice (best-effort; ignores "not found"). Used to
