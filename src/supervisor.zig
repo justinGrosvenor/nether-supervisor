@@ -301,17 +301,22 @@ pub const Supervisor = struct {
             rlen += n;
             // Process complete lines.
             while (std.mem.indexOfScalar(u8, rbuf[0..rlen], '\n')) |nl| {
+                // Dispatch before compacting rbuf: `line` aliases its front, so
+                // moving a pipelined command over it first corrupts the command
+                // currently being handled. The defer also consumes blank/error
+                // lines on every `continue` path.
+                const consumed = nl + 1;
+                defer {
+                    const rest = rbuf[consumed..rlen];
+                    std.mem.copyForwards(u8, rbuf[0..rest.len], rest);
+                    rlen = rest.len;
+                }
                 const line = std.mem.trim(u8, rbuf[0..nl], " \t\r");
-                // Shift the remainder to the front.
-                const rest = rbuf[nl + 1 .. rlen];
-                std.mem.copyForwards(u8, rbuf[0..rest.len], rest);
-                rlen = rest.len;
-
                 if (line.len == 0) continue;
                 if (std.mem.eql(u8, line, "__info__")) {
                     const r = proto.buildReply(&out, control_server.INFO_REPORT, 0) catch continue;
                     os.writeAll(conn, r) catch return;
-                } else if (std.mem.startsWith(u8, line, "ensure")) {
+                } else if (std.mem.eql(u8, line, "ensure") or std.mem.startsWith(u8, line, "ensure ")) {
                     var it = std.mem.tokenizeScalar(u8, line, ' ');
                     _ = it.next();
                     const tenant = it.next() orelse {
@@ -512,4 +517,45 @@ pub const Supervisor = struct {
 fn sleepMs(ms: u64) void {
     var req = std.posix.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     _ = std.c.nanosleep(&req, null);
+}
+
+test "serveConn preserves pipelined command boundaries" {
+    const posix = std.posix;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        posix.system.socketpair(@intCast(posix.AF.UNIX), posix.SOCK.STREAM, 0, &fds),
+    );
+    defer os.closeFd(fds[0]);
+
+    var supervisor = Supervisor.init(config.init(std.testing.allocator));
+    defer supervisor.cfg.deinit();
+
+    const Runner = struct {
+        fn run(s: *Supervisor, fd: posix.fd_t) void {
+            s.serveConn(fd);
+            os.closeFd(fd);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &supervisor, fds[1] });
+
+    try os.writeAll(fds[0], "__info__\nensure\n");
+    _ = std.c.shutdown(fds[0], 1); // SHUT_WR: let serveConn finish after both commands.
+
+    var wire: [1024]u8 = undefined;
+    var used: usize = 0;
+    while (true) {
+        const n = try os.readSome(fds[0], wire[used..]);
+        if (n == 0) break;
+        used += n;
+    }
+    thread.join();
+
+    const first = proto.parseFrame(wire[0..used]) orelse return error.MissingFirstFrame;
+    try std.testing.expectEqualStrings(control_server.INFO_REPORT, first.body);
+    try std.testing.expectEqual(@as(u8, 0), first.exit);
+    const second = proto.parseFrame(wire[first.consumed..used]) orelse return error.MissingSecondFrame;
+    try std.testing.expectEqualStrings("ensure requires a tenant", second.body);
+    try std.testing.expectEqual(@as(u8, 1), second.exit);
+    try std.testing.expectEqual(used, first.consumed + second.consumed);
 }

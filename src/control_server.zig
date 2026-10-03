@@ -49,7 +49,7 @@ pub fn handleLine(
         return .{ .reply = try proto.buildReply(out, INFO_REPORT, 0) };
     }
 
-    if (std.mem.startsWith(u8, trimmed, "ensure")) {
+    if (std.mem.eql(u8, trimmed, "ensure") or std.mem.startsWith(u8, trimmed, "ensure ")) {
         // "ensure <tenant>" - split on the first space.
         var it = std.mem.tokenizeScalar(u8, trimmed, ' ');
         _ = it.next(); // "ensure"
@@ -120,4 +120,7 @@ test "handleLine: blank line is ignored; unknown verb is a framed error" {
     try testing.expect((try handleLine("   ", StubPool.ensure, &pool, &out)) == .ignore);
     const d = try handleLine("__frobnicate__", StubPool.ensure, &pool, &out);
     try testing.expect(std.mem.endsWith(u8, d.reply, "\x1e127\n"));
+    const d2 = try handleLine("ensure-other alpha", StubPool.ensure, &pool, &out);
+    try testing.expect(std.mem.endsWith(u8, d2.reply, "\x1e127\n"));
+    try testing.expectEqual(@as(usize, 0), pool.calls);
 }
