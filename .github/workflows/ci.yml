@@ -24,7 +24,7 @@ jobs:
         os: [macos-15, ubuntu-24.04]
         optimize: [Debug, ReleaseSafe]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
